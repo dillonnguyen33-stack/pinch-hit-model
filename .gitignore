@@ -1,0 +1,16 @@
+# Runtime state / caches — regenerate at runtime, never commit
+pregame_players_*.json
+pregame_posted.json
+pregame_predictions.json
+pregame_accuracy.json
+phrase_attribution.json
+fire_log.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Env / secrets
+.env
+.env.*
