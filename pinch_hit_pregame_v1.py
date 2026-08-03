@@ -70,7 +70,7 @@ RECENCY_DAYS          = int(os.environ.get("RECENCY_DAYS", "14"))   # window for
 PINCH_HIST_DAYS       = int(os.environ.get("PINCH_HIST_DAYS", "14"))  # window for player pinch-hit-for history + --trend (14 trending, 21 more stable)
 TREND_TOP_N           = int(os.environ.get("TREND_TOP_N", "15"))      # rows in the --trend leaderboard
 LEAD_MINUTES          = int(os.environ.get("LEAD_MINUTES", "60"))    # serve mode: fire this many min before each game's first pitch
-POLL_MINUTES          = int(os.environ.get("POLL_MINUTES", "10"))    # serve mode: how often the scheduler checks
+POLL_MINUTES          = int(os.environ.get("POLL_MINUTES", "5"))     # serve mode: how often the scheduler checks for new lineups
 GAME_TOP_N            = int(os.environ.get("GAME_TOP_N", "5"))       # max picks per per-game embed
 POST_MIN_SCORE        = int(os.environ.get("POST_MIN_SCORE", "60"))  # serve mode: only ping a game if its top pick >= this
 POSTED_STATE_PATH     = os.environ.get("POSTED_STATE_PATH", _p("pregame_posted.json"))
@@ -822,65 +822,70 @@ def active_hitters(team_id):
         print(f"[roster] team {team_id} error: {e}")
     return out
 
-def analyze_game(g, mgr, lineup=None, ph_hist=None, unavailable=None):
-    """Score every starter in a single game. Uses the OFFICIAL batting-order lineup
-    (confirmed_lineup) — not the schedule's predicted feed — so non-starters can't
-    slip in. `ph_hist` is {"tid|last": count} of recent pinch-hits; `unavailable` is
-    the set of gassed relievers to drop from the pen. Returns candidates sorted by score."""
-    candidates = []
+def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=None):
+    """Score one team's hitters vs the opposing probable pitcher. Only needs THAT
+    team's lineup (+ the opposing SP, known in advance) — so we can fire the instant
+    a team's lineup drops, without waiting for the opponent's."""
     ph_hist = ph_hist or {}
-    if lineup is None:
-        lineup = confirmed_lineup(g.get("gamePk"))
-    for side, opp_side in (("away", "home"), ("home", "away")):
-        starters = lineup.get(side, [])
-        if len(starters) < 9:
-            continue
-        team = g["teams"][side]["team"]
-        opp_team = g["teams"][opp_side]["team"]
-        sp = g["teams"][opp_side].get("probablePitcher", {})
-        sp_id = sp.get("id")
-        sp_name = sp.get("fullName", "TBD")
-        sp_hand = pitcher_hand(sp_id) if sp_id else None
-        if sp_hand not in ("L", "R"):
-            continue  # can't score platoon without SP handedness
+    if len(starters) < 9:
+        return []
+    team = g["teams"][side]["team"]
+    opp_team = g["teams"][opp_side]["team"]
+    sp = g["teams"][opp_side].get("probablePitcher", {})
+    sp_id = sp.get("id")
+    sp_name = sp.get("fullName", "TBD")
+    sp_hand = pitcher_hand(sp_id) if sp_id else None
+    if sp_hand not in ("L", "R"):
+        return []  # can't score platoon without SP handedness
 
-        tier = mgr.get(str(team["id"]), {}).get("tier", "med")
-        mgr_meta = mgr.get(str(team["id"]), {})
+    tier = mgr.get(str(team["id"]), {}).get("tier", "med")
+    mgr_meta = mgr.get(str(team["id"]), {})
+    starter_ids = {s["id"] for s in starters}
+    bench = [p for p in active_hitters(team["id"]) if p["id"] not in starter_ids]
+    pen_mix = opposing_bullpen_mix(opp_team["id"], sp_id, unavailable)
+    sp_len  = starter_length(sp_id)
 
-        starter_ids = {s["id"] for s in starters}
-        bench = [p for p in active_hitters(team["id"]) if p["id"] not in starter_ids]
-        pen_mix = opposing_bullpen_mix(opp_team["id"], sp_id, unavailable)
-        sp_len  = starter_length(sp_id)          # opposing starter's avg IP/start (#1)
-
-        for order, s in enumerate(starters, start=1):
-            prof = get_hitter_profile(s["id"], s.get("fullName"))
-            scenario = classify_matchup(prof, sp_hand)
-            bats  = prof.get("bats")
-            faced = "vl" if sp_hand == "L" else "vr"
-            opp   = "vr" if sp_hand == "L" else "vl"
-            bench_note = None
-            if scenario == "disadvantage":
-                bench_note = find_bench_upgrade(prof.get(faced, {}).get("ops"), sp_hand, bench)
-            elif scenario == "flip":
-                bench_note = find_bench_upgrade(prof.get(opp, {}).get("ops"), bats, bench)
-            bvp = get_bvp(s["id"], sp_id) if sp_id else None
-            ph_count = ph_hist.get(f"{team['id']}|{_lastname(prof.get('name') or s.get('fullName'))}", 0)
-            arsenal = arsenal_matchup(s["id"], sp_id) if sp_id else None
-            score, reasons = score_starter(prof, sp_hand, sp_name, order, tier, bench_note,
-                                           scenario, pen_mix, bvp, ph_count, sp_len, arsenal)
-            if score >= MIN_SCORE:
-                candidates.append({
-                    "score": score, "name": prof.get("name") or s.get("fullName"),
-                    "pid": s["id"], "gamePk": g.get("gamePk"),
-                    "bats": prof.get("bats"), "order": order, "scenario": scenario,
-                    "team": team.get("abbreviation") or team.get("name"),
-                    "opp": opp_team.get("abbreviation") or opp_team.get("name"),
-                    "sp_name": sp_name, "sp_hand": sp_hand,
-                    "reasons": reasons,
-                    "mgr_rate": mgr_meta.get("rate"), "mgr_games": mgr_meta.get("games"),
-                })
+    candidates = []
+    for order, s in enumerate(starters, start=1):
+        prof = get_hitter_profile(s["id"], s.get("fullName"))
+        scenario = classify_matchup(prof, sp_hand)
+        bats  = prof.get("bats")
+        faced = "vl" if sp_hand == "L" else "vr"
+        opp   = "vr" if sp_hand == "L" else "vl"
+        bench_note = None
+        if scenario == "disadvantage":
+            bench_note = find_bench_upgrade(prof.get(faced, {}).get("ops"), sp_hand, bench)
+        elif scenario == "flip":
+            bench_note = find_bench_upgrade(prof.get(opp, {}).get("ops"), bats, bench)
+        bvp = get_bvp(s["id"], sp_id) if sp_id else None
+        ph_count = ph_hist.get(f"{team['id']}|{_lastname(prof.get('name') or s.get('fullName'))}", 0)
+        arsenal = arsenal_matchup(s["id"], sp_id) if sp_id else None
+        score, reasons = score_starter(prof, sp_hand, sp_name, order, tier, bench_note,
+                                       scenario, pen_mix, bvp, ph_count, sp_len, arsenal)
+        if score >= MIN_SCORE:
+            candidates.append({
+                "score": score, "name": prof.get("name") or s.get("fullName"),
+                "pid": s["id"], "gamePk": g.get("gamePk"),
+                "bats": prof.get("bats"), "order": order, "scenario": scenario,
+                "team": team.get("abbreviation") or team.get("name"),
+                "opp": opp_team.get("abbreviation") or opp_team.get("name"),
+                "sp_name": sp_name, "sp_hand": sp_hand,
+                "reasons": reasons,
+                "mgr_rate": mgr_meta.get("rate"), "mgr_games": mgr_meta.get("games"),
+            })
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates
+
+def analyze_game(g, mgr, lineup=None, ph_hist=None, unavailable=None):
+    """Both sides of a game (used by --print / build_board). Serve mode calls
+    analyze_side directly, per side, as each lineup drops."""
+    if lineup is None:
+        lineup = confirmed_lineup(g.get("gamePk"))
+    cands = []
+    for side, opp_side in (("away", "home"), ("home", "away")):
+        cands += analyze_side(g, side, opp_side, lineup.get(side, []), mgr, ph_hist, unavailable)
+    cands.sort(key=lambda c: c["score"], reverse=True)
+    return cands
 
 def build_board(date_str, limit=None):
     """Whole-slate board (manual/--print mode)."""
@@ -993,14 +998,14 @@ _MATCHUP = {
 }
 
 def post_game_embed(g, cands, when_str):
-    away = g["teams"]["away"]["team"].get("abbreviation") or g["teams"]["away"]["team"]["name"]
-    home = g["teams"]["home"]["team"].get("abbreviation") or g["teams"]["home"]["team"]["name"]
-    title = f"Pinch-hit board — {away} @ {home}"
+    """Posts one team's board (per side). Title reflects the batting team vs the
+    opposing starter, since serve fires each side as its lineup drops."""
     if not cands:
         return
-    top = cands[:GAME_TOP_N]
+    c0 = cands[0]
+    title = f"Pinch-hit board — {c0['team']} vs {c0['sp_hand']}HP {c0['sp_name']}"
     fields = []
-    for i, c in enumerate(top, 1):
+    for i, c in enumerate(cands[:GAME_TOP_N], 1):
         matchup = _MATCHUP.get(c.get("scenario"), "")
         nm = f"#{i}  {c['name']} ({c['bats']}, {_ord(c['order'])})  —  {c['score']}/100 {_conf_label(c['score'])}"
         val = (f"_{matchup}_\n" if matchup else "")
@@ -1011,9 +1016,9 @@ def post_game_embed(g, cands, when_str):
         fields.append({"name": nm[:256], "value": val[:1024], "inline": False})
     _post_embed({
         "title": title,
-        "description": (f"First pitch **{when_str}** · **Confidence /100** = the model's read on how "
-                        f"likely each starter is lifted early / limited to few at-bats. "
-                        f"Higher = better under (H+R+RBI / hits)."),
+        "description": (f"{c0['team']} vs {c0['opp']} · first pitch **{when_str}** · "
+                        f"**Confidence /100** = how likely each starter is lifted early / limited "
+                        f"to few at-bats. Higher = better under (H+R+RBI / hits)."),
         "color": 0x5865F2,
         "fields": fields,
         "footer": {"text": "Pinch-hit model · review and forward your picks"},
@@ -1086,35 +1091,37 @@ def run_scheduler():
 
             for g in games:
                 pk = g.get("gamePk")
-                if pk in posted:
-                    continue
                 state = g.get("status", {}).get("abstractGameState")
-                if state in ("Live", "Final"):           # started before we could post — skip
-                    _mark_posted(today, pk); posted.add(pk)
-                    continue
                 gd = g.get("gameDate")
                 try:
                     first = datetime.fromisoformat(gd.replace("Z", "+00:00")) if gd else None
                 except Exception:
                     first = None
-                # Fire AS SOON AS the official lineup drops — no fixed lead time. MLB
-                # posts these ~2-4h out; acting immediately gives the most time to shop.
-                lineup = confirmed_lineup(pk)
-                if len(lineup["away"]) < 9 or len(lineup["home"]) < 9:
-                    continue                             # official card not posted yet — retry next poll
                 when = _fmt_local(first) if first else "TBD"
-                cands = analyze_game(g, mgr, lineup, ph_hist, unavail)
-                _save(PLAYER_CACHE_PATH, _player_cache)
-                _mark_posted(today, pk); posted.add(pk)  # analyzed — don't repeat this game
-                a = g["teams"]["away"]["team"].get("abbreviation")
-                h = g["teams"]["home"]["team"].get("abbreviation")
-                top = cands[0]["score"] if cands else 0
-                if top >= POST_MIN_SCORE:                # only PING when there's a real candidate
-                    post_game_embed(g, cands, when)
-                    record_predictions(today, cands[:GAME_TOP_N])
-                    print(f"[serve] posted {a} @ {h} — top {top}, {len(cands)} pick(s)")
-                else:
-                    print(f"[serve] skipped {a} @ {h} — top {top} < {POST_MIN_SCORE} (no ping)")
+                # Fire per SIDE the instant that team's official lineup drops — don't wait
+                # for the opponent's lineup (a team's pull-risk only needs its own lineup +
+                # the opposing probable pitcher, known hours ahead).
+                lineup = confirmed_lineup(pk)
+                for side, opp_side in (("away", "home"), ("home", "away")):
+                    skey = f"{pk}:{side}"
+                    if skey in posted:
+                        continue
+                    if state in ("Live", "Final"):        # game started — too late for this side
+                        _mark_posted(today, skey); posted.add(skey)
+                        continue
+                    if len(lineup.get(side, [])) < 9:     # this team's card not posted yet
+                        continue
+                    cands = analyze_side(g, side, opp_side, lineup[side], mgr, ph_hist, unavail)
+                    _save(PLAYER_CACHE_PATH, _player_cache)
+                    _mark_posted(today, skey); posted.add(skey)   # analyzed — don't repeat this side
+                    tm = g["teams"][side]["team"].get("abbreviation")
+                    top = cands[0]["score"] if cands else 0
+                    if top >= POST_MIN_SCORE:
+                        post_game_embed(g, cands, when)
+                        record_predictions(today, cands[:GAME_TOP_N])
+                        print(f"[serve] posted {tm} — top {top}, {len(cands)} pick(s)")
+                    else:
+                        print(f"[serve] skipped {tm} — top {top} < {POST_MIN_SCORE} (no ping)")
 
             # Daily grading + trend leaderboard: once past RESULTS_HOUR_ET (once/day).
             now_et = datetime.now(ET_TZ)
