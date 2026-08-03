@@ -1010,13 +1010,15 @@ _MATCHUP = {
     "flip": "platoon-flip (good vs starter, weak vs same-side relievers later)",
 }
 
-def post_game_embed(g, cands, when_str):
+def post_game_embed(g, cands, when_str, is_update=False):
     """Posts one team's board (per side). Title reflects the batting team vs the
-    opposing starter, since serve fires each side as its lineup drops."""
+    opposing starter, since serve fires each side as its lineup drops. `is_update`
+    marks a re-post after the lineup changed."""
     if not cands:
         return
     c0 = cands[0]
-    title = f"Pinch-hit board — {c0['team']} vs {c0['sp_hand']}HP {c0['sp_name']}"
+    prefix = "🔄 Lineup update — " if is_update else ""
+    title = f"{prefix}Pinch-hit board — {c0['team']} vs {c0['sp_hand']}HP {c0['sp_name']}"
     fields = []
     for i, c in enumerate(cands[:GAME_TOP_N], 1):
         matchup = _MATCHUP.get(c.get("scenario"), "")
@@ -1061,13 +1063,22 @@ def trend_board(date_str, to_discord=True):
         print(f"Pinch-hit trend — last {PINCH_HIST_DAYS}d\n" + body)
 
 # ── per-game scheduler (serve mode) ───────────────────────────────────────────
-def _mark_posted(date_str, pk):
+# Dedupe is keyed by lineup FINGERPRINT, not just "posted once". A side is re-scanned
+# (and re-posted as an adjustment) when its official batting order CHANGES — e.g. a
+# late scratch or swap. Unchanged lineups are never re-touched.
+def _posted_today(date_str):
+    d = _load(POSTED_STATE_PATH).get(date_str, {})
+    return d if isinstance(d, dict) else {}   # tolerate old list format
+
+def _mark_handled(date_str, skey, fp, posted):
     d = _load(POSTED_STATE_PATH)
     cutoff = (datetime.now(ET_TZ).date() - timedelta(days=2)).strftime("%Y-%m-%d")
-    d = {k: v for k, v in d.items() if k >= cutoff}   # prune old days
-    d.setdefault(date_str, [])
-    if pk not in d[date_str]:
-        d[date_str].append(pk)
+    d = {k: v for k, v in d.items() if k >= cutoff}
+    day = d.setdefault(date_str, {})
+    if not isinstance(day, dict):
+        day = {}
+        d[date_str] = day
+    day[skey] = {"fp": fp, "posted": posted}
     _save(POSTED_STATE_PATH, d)
 
 def run_scheduler():
@@ -1099,8 +1110,7 @@ def run_scheduler():
             ph_rows = pinch_hit_history(today)            # player pinch-hit history (shared scan)
             ph_hist = {r["key"]: r["count"] for r in ph_rows}
             unavail = unavailable_relievers(today)        # gassed relievers (shared scan)
-            posted = set(_load(POSTED_STATE_PATH).get(today, []))
-            now = datetime.now(timezone.utc)
+            posted = _posted_today(today)                 # {skey: {"fp","posted"}}
 
             for g in games:
                 pk = g.get("gamePk")
@@ -1111,30 +1121,37 @@ def run_scheduler():
                 except Exception:
                     first = None
                 when = _fmt_local(first) if first else "TBD"
-                # Fire per SIDE the instant that team's official lineup drops — don't wait
-                # for the opponent's lineup (a team's pull-risk only needs its own lineup +
-                # the opposing probable pitcher, known hours ahead).
+                # Fire per SIDE the instant that team's official lineup drops. Re-fire as an
+                # ADJUSTMENT if the lineup FINGERPRINT changes (late scratch/swap); skip if
+                # it's the same lineup we already handled.
                 lineup = confirmed_lineup(pk)
                 for side, opp_side in (("away", "home"), ("home", "away")):
+                    starters = lineup.get(side, [])
+                    if len(starters) < 9:                 # this team's card not posted yet
+                        continue
                     skey = f"{pk}:{side}"
-                    if skey in posted:
+                    fp = ",".join(str(s["id"]) for s in starters)
+                    prev = posted.get(skey)
+                    if prev and prev.get("fp") == fp:     # same lineup already handled → skip
                         continue
-                    if state in ("Live", "Final"):        # game started — too late for this side
-                        _mark_posted(today, skey); posted.add(skey)
+                    if state in ("Live", "Final"):        # game started — too late
+                        _mark_handled(today, skey, fp, False); posted[skey] = {"fp": fp, "posted": False}
                         continue
-                    if len(lineup.get(side, [])) < 9:     # this team's card not posted yet
-                        continue
-                    cands = analyze_side(g, side, opp_side, lineup[side], mgr, ph_hist, unavail)
+                    is_update = bool(prev and prev.get("posted"))   # we already posted a different lineup
+                    cands = analyze_side(g, side, opp_side, starters, mgr, ph_hist, unavail)
                     _save(PLAYER_CACHE_PATH, _player_cache)
-                    _mark_posted(today, skey); posted.add(skey)   # analyzed — don't repeat this side
                     tm = g["teams"][side]["team"].get("abbreviation")
                     top = cands[0]["score"] if cands else 0
-                    if top >= POST_MIN_SCORE:
-                        post_game_embed(g, cands, when)
+                    will_post = top >= POST_MIN_SCORE
+                    _mark_handled(today, skey, fp, will_post)
+                    posted[skey] = {"fp": fp, "posted": will_post}
+                    tag = " [UPDATE]" if is_update else ""
+                    if will_post:
+                        post_game_embed(g, cands, when, is_update)
                         record_predictions(today, cands[:GAME_TOP_N])
-                        print(f"[serve] posted {tm} — top {top}, {len(cands)} pick(s)")
+                        print(f"[serve] posted{tag} {tm} — top {top}, {len(cands)} pick(s)")
                     else:
-                        print(f"[serve] skipped {tm} — top {top} < {POST_MIN_SCORE} (no ping)")
+                        print(f"[serve] skipped{tag} {tm} — top {top} < {POST_MIN_SCORE} (no ping)")
 
             # Daily grading + trend leaderboard: once past RESULTS_HOUR_ET (once/day).
             now_et = datetime.now(ET_TZ)
@@ -1395,7 +1412,16 @@ def main():
     ap.add_argument("--trend", nargs="?", const="__today__", default=None, metavar="DATE",
                     help="leaderboard of players most pinch-hit for over the last PINCH_HIST_DAYS; "
                          "posts to Discord (default date: today)")
+    ap.add_argument("--clear-posted", action="store_true",
+                    help="wipe today's posted-state so serve re-scans every game/side on its next "
+                         "poll (use after a mid-slate fix to force fresh boards)")
     args = ap.parse_args()
+
+    if args.clear_posted:
+        today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+        d = _load(POSTED_STATE_PATH); d.pop(today, None); _save(POSTED_STATE_PATH, d)
+        print(f"[clear] wiped posted-state for {today} — serve will re-scan all games next poll.")
+        return
 
     if args.stats:
         db_stats()
