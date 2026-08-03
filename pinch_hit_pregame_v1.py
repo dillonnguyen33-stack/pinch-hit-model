@@ -661,8 +661,11 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
             reasons.append(f"Opp starter avgs {sp_len:.1f} IP/start — goes deep, flip less likely")
 
     # Pitch-arsenal matchup (#2): does the hitter handle this pitcher's mix? PRODUCTION
-    # signal (does the under cash if he bats), not pull-risk.
-    if arsenal and arsenal.get("wrv") is not None:
+    # signal — applies to a weak-side under (he faces the tough arm most of the game).
+    # SKIPPED for flip: the flip under is a VOLUME play (1-2 fewer ABs), his production
+    # is a coin flip, and the arsenal we measure is vs the starter he was started to hit
+    # WELL — so it's both irrelevant and misleading here.
+    if scenario != "flip" and arsenal and arsenal.get("wrv") is not None:
         wrv = arsenal["wrv"]
         score += max(-8.0, min(8.0, -wrv * 6.0))   # negative wrv (struggles) → boosts under
         pt = _PT_NAMES.get(arsenal.get("top_pt"), arsenal.get("top_pt", ""))
@@ -671,13 +674,15 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
         elif wrv >= 0.4:
             reasons.append(f"Handles {sp_name}'s arsenal well ({wrv:+.1f} RV/100) — favorable, less under value")
 
-    # Statcast overall quality (#1): weak bats are more pull-prone; strong bats get kept.
+    # Statcast overall quality: weak bats are more pull-prone (applies to both scenarios).
+    # The strong-bat dampener is SKIPPED for flip — a good platoon hitter still gets
+    # flipped out; his quality doesn't keep him in when the handedness turns.
     xw = prof.get("xwoba")
     if xw is not None:
         if xw < 0.300:
             score += 6
             reasons.append(f"Weak overall bat ({_fmt(xw)} xwOBA, Statcast) — pull-prone")
-        elif xw > 0.360:
+        elif xw > 0.360 and scenario != "flip":
             score *= 0.90
             reasons.append(f"Strong overall bat ({_fmt(xw)} xwOBA, Statcast) — managers keep him")
 
