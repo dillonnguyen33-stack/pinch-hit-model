@@ -726,6 +726,18 @@ def run_scheduler():
           f"Pings only when top confidence ≥ {POST_MIN_SCORE}.")
     if not PREGAME_WEBHOOK_URL:
         print("[serve][warn] PREGAME_WEBHOOK_URL not set — embeds will print to console.")
+    # Persistence check — surfaces DATA_DIR problems in the deploy logs.
+    if DATA_DIR:
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            _t = os.path.join(DATA_DIR, ".write_test")
+            open(_t, "w").close(); os.remove(_t)
+            print(f"[serve] DATA_DIR={DATA_DIR} (writable) · results DB → {RESULTS_DB_PATH}")
+        except Exception as e:
+            print(f"[serve][warn] DATA_DIR={DATA_DIR} is NOT writable ({e}) — check the volume mount path.")
+    else:
+        print("[serve][warn] DATA_DIR unset — state saves to the working dir and WIPES on redeploy. "
+              "Set DATA_DIR to your volume mount (e.g. /data).")
     while True:
         try:
             today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
