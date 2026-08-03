@@ -59,13 +59,14 @@ MANAGER_LOOKBACK_DAYS = int(os.environ.get("MANAGER_LOOKBACK_DAYS", "14"))
 RECENCY_DAYS          = int(os.environ.get("RECENCY_DAYS", "14"))   # window for recent-form signal
 LEAD_MINUTES          = int(os.environ.get("LEAD_MINUTES", "60"))    # serve mode: fire this many min before each game's first pitch
 POLL_MINUTES          = int(os.environ.get("POLL_MINUTES", "10"))    # serve mode: how often the scheduler checks
-GAME_TOP_N            = int(os.environ.get("GAME_TOP_N", "6"))       # max picks per per-game embed
+GAME_TOP_N            = int(os.environ.get("GAME_TOP_N", "5"))       # max picks per per-game embed
+POST_MIN_SCORE        = int(os.environ.get("POST_MIN_SCORE", "60"))  # serve mode: only ping a game if its top pick >= this
 POSTED_STATE_PATH     = os.environ.get("POSTED_STATE_PATH", "pregame_posted.json")
 RESULTS_HOUR_ET       = int(os.environ.get("RESULTS_HOUR_ET", "3"))   # serve mode: grade the prior day at ~this hour
 PREDICTIONS_PATH      = os.environ.get("PREDICTIONS_PATH", "pregame_predictions.json")
 ACCURACY_PATH         = os.environ.get("ACCURACY_PATH", "pregame_accuracy.json")
 TOP_N                 = int(os.environ.get("TOP_N", "10"))
-MIN_SCORE             = int(os.environ.get("MIN_SCORE", "35"))
+MIN_SCORE             = int(os.environ.get("MIN_SCORE", "55"))       # hide picks below this confidence
 SEASON                = int(os.environ.get("SEASON", str(datetime.now(ET_TZ).year)))
 
 # Disk caches so re-runs (and bench lookups) don't re-hit the API.
@@ -435,14 +436,32 @@ def find_bench_upgrade(ref_ops, plan_hand, bench_players):
 
 # ── slate ─────────────────────────────────────────────────────────────────────
 def get_slate(date_str, limit=None):
-    """Games with posted lineups + probable pitchers. Returns list of dicts."""
+    """Games with probable pitchers. Returns list of dicts."""
     sched = _get(f"{API}/schedule",
                  params={"sportId": 1, "date": date_str,
-                         "hydrate": "probablePitcher,lineups,team"})
+                         "hydrate": "probablePitcher,team"})
     games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
     if limit:
         games = games[:limit]
     return games
+
+def confirmed_lineup(game_pk):
+    """The OFFICIAL lineup from the boxscore batting-order card — authoritative,
+    unlike the schedule's `lineups` hydrate which can carry a PREDICTED lineup
+    that later changes (this is what wrongly included a non-starter). Returns
+    {"away":[{id,fullName}], "home":[...]} in batting order; empty until posted."""
+    out = {"away": [], "home": []}
+    try:
+        data = _get(f"{API}/game/{game_pk}/boxscore", timeout=20)   # lighter than feed/live
+    except Exception:
+        return out
+    box = data.get("teams", {})
+    for side in ("away", "home"):
+        players = box.get(side, {}).get("players", {})
+        for pid in box.get(side, {}).get("battingOrder", []):
+            pd = players.get(f"ID{pid}", {})
+            out[side].append({"id": pid, "fullName": pd.get("person", {}).get("fullName", "")})
+    return out
 
 def pitcher_hand(pid):
     """Cached L/R for a pitcher (used for the probable SP and each reliever)."""
@@ -492,13 +511,16 @@ def active_hitters(team_id):
         print(f"[roster] team {team_id} error: {e}")
     return out
 
-def analyze_game(g, mgr):
-    """Score every starter in a single game dict. Returns candidates sorted by score."""
+def analyze_game(g, mgr, lineup=None):
+    """Score every starter in a single game. Uses the OFFICIAL batting-order lineup
+    (confirmed_lineup) — not the schedule's predicted feed — so non-starters can't
+    slip in. Returns candidates sorted by score."""
     candidates = []
-    lu = g.get("lineups", {})
+    if lineup is None:
+        lineup = confirmed_lineup(g.get("gamePk"))
     for side, opp_side in (("away", "home"), ("home", "away")):
-        starters = lu.get(f"{side}Players", [])
-        if not starters:
+        starters = lineup.get(side, [])
+        if len(starters) < 9:
             continue
         team = g["teams"][side]["team"]
         opp_team = g["teams"][opp_side]["team"]
@@ -643,44 +665,43 @@ def _post_embed(embed):
     except Exception as e:
         print(f"[discord embed] {e}")
 
+def _conf_label(s):
+    return "Elite" if s >= 80 else "High" if s >= 65 else "Lean" if s >= 55 else "Low"
+
+# Plain-language matchup type — no emoji, no caution sign.
+_MATCHUP = {
+    "disadvantage": "weak-side matchup",
+    "flip": "platoon-flip (good vs starter, weak vs same-side relievers later)",
+}
+
 def post_game_embed(g, cands, when_str):
     away = g["teams"]["away"]["team"].get("abbreviation") or g["teams"]["away"]["team"]["name"]
     home = g["teams"]["home"]["team"].get("abbreviation") or g["teams"]["home"]["team"]["name"]
-    title = f"🎯 Pull-Risk — {away} @ {home}"
-    tagmap = {"flip": "🔄 platoon-flip", "disadvantage": "⚠️ poor matchup"}
+    title = f"Pinch-hit board — {away} @ {home}"
     if not cands:
-        _post_embed({"title": title, "color": 0x95A5A6,
-                     "description": f"First pitch **{when_str}** — no qualifying pull-risk starters "
-                                    f"(no strong platoon spots)."})
         return
     top = cands[:GAME_TOP_N]
     fields = []
     for i, c in enumerate(top, 1):
-        nm = (f"#{i}  {_emoji(c['score'])} {c['score']}  {c['name']} "
-              f"({c['bats']}, {_ord(c['order'])}) · {tagmap.get(c.get('scenario'), '')}")
-        val = "\n".join(f"• {r}" for r in c["reasons"])
+        matchup = _MATCHUP.get(c.get("scenario"), "")
+        nm = f"#{i}  {c['name']} ({c['bats']}, {_ord(c['order'])})  —  {c['score']}/100 {_conf_label(c['score'])}"
+        val = (f"_{matchup}_\n" if matchup else "")
+        val += "\n".join(f"• {r}" for r in c["reasons"])
         summ = claude_summary(c)
         if summ:
             val += f"\n→ {summ}"
         fields.append({"name": nm[:256], "value": val[:1024], "inline": False})
     _post_embed({
         "title": title,
-        "description": f"First pitch **{when_str}** · ranked most→least likely to be lifted "
-                       f"early. Bet unders (H+R+RBI / hits), shop best odds.",
-        "color": _color(top[0]["score"]),
+        "description": (f"First pitch **{when_str}** · **Confidence /100** = the model's read on how "
+                        f"likely each starter is lifted early / limited to few at-bats. "
+                        f"Higher = better under (H+R+RBI / hits)."),
+        "color": 0x5865F2,
         "fields": fields,
-        "footer": {"text": "Pregame Pull-Risk Board v1 · review & forward your picks"},
+        "footer": {"text": "Pinch-hit model · review and forward your picks"},
     })
 
 # ── per-game scheduler (serve mode) ───────────────────────────────────────────
-def _lineups_both(g):
-    lu = g.get("lineups", {})
-    return len(lu.get("awayPlayers", [])) >= 9 and len(lu.get("homePlayers", [])) >= 9
-
-def _lineups_any(g):
-    lu = g.get("lineups", {})
-    return len(lu.get("awayPlayers", [])) >= 9 or len(lu.get("homePlayers", [])) >= 9
-
 def _mark_posted(date_str, pk):
     d = _load(POSTED_STATE_PATH)
     cutoff = (datetime.now(ET_TZ).date() - timedelta(days=2)).strftime("%Y-%m-%d")
@@ -699,7 +720,7 @@ def run_scheduler():
         try:
             today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
             sched = _get(f"{API}/schedule", params={"sportId": 1, "date": today,
-                        "hydrate": "probablePitcher,lineups,team"})
+                        "hydrate": "probablePitcher,team"})
             games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
             mgr = manager_tendency(today)                 # cached per date
             posted = set(_load(POSTED_STATE_PATH).get(today, []))
@@ -723,17 +744,22 @@ def run_scheduler():
                 mins_to = (first - now).total_seconds() / 60.0
                 if mins_to > LEAD_MINUTES:               # not within the lead window yet
                     continue
-                # within the window: fire once both lineups are up (or one, if <10m to go)
-                if _lineups_both(g) or (mins_to <= 10 and _lineups_any(g)):
-                    cands = analyze_game(g, mgr)
+                # within the window: wait for the OFFICIAL lineup (both batting orders set)
+                lineup = confirmed_lineup(pk)
+                if len(lineup["away"]) < 9 or len(lineup["home"]) < 9:
+                    continue                             # official card not posted yet — retry next poll
+                cands = analyze_game(g, mgr, lineup)
+                _save(PLAYER_CACHE_PATH, _player_cache)
+                _mark_posted(today, pk); posted.add(pk)  # analyzed — don't repeat this game
+                a = g["teams"]["away"]["team"].get("abbreviation")
+                h = g["teams"]["home"]["team"].get("abbreviation")
+                top = cands[0]["score"] if cands else 0
+                if top >= POST_MIN_SCORE:                # only PING when there's a real candidate
                     post_game_embed(g, cands, _fmt_local(first))
-                    record_predictions(today, cands[:GAME_TOP_N])   # for end-of-day grading
-                    _save(PLAYER_CACHE_PATH, _player_cache)
-                    _mark_posted(today, pk); posted.add(pk)
-                    a = g["teams"]["away"]["team"].get("abbreviation")
-                    h = g["teams"]["home"]["team"].get("abbreviation")
-                    print(f"[serve] posted {a} @ {h} — {len(cands)} pick(s), first pitch {_fmt_local(first)}")
-                # else: in window but lineups not posted yet — retry next poll
+                    record_predictions(today, cands[:GAME_TOP_N])
+                    print(f"[serve] posted {a} @ {h} — top {top}, {len(cands)} pick(s)")
+                else:
+                    print(f"[serve] skipped {a} @ {h} — top {top} < {POST_MIN_SCORE} (no ping)")
 
             # Daily grading: once past RESULTS_HOUR_ET, grade the prior day (once).
             now_et = datetime.now(ET_TZ)
@@ -811,11 +837,13 @@ def fetch_actuals(game_pk):
 def grade_day(date_str, to_discord=True):
     preds = _load(PREDICTIONS_PATH).get(date_str, [])
     if not preds:
-        msg = f"📊 Results — {date_str}: no predictions were recorded for this day."
-        if to_discord:
-            _post_embed({"title": f"📊 Results — {date_str}", "description": msg, "color": 0x95A5A6})
-        else:
-            print(msg)
+        # Mark the day done so the scheduler doesn't re-check (and re-post) every poll.
+        # Don't spam Discord with an empty card — just log it.
+        acc = _load(ACCURACY_PATH)
+        if not any(d.get("date") == date_str for d in acc.get("days", [])):
+            acc.setdefault("days", []).append({"date": date_str, "total": 0, "hits": 0})
+            _save(ACCURACY_PATH, acc)
+        print(f"📊 Results — {date_str}: no predictions recorded (nothing to grade).")
         return
 
     by_game = {}
