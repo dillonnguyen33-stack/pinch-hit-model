@@ -45,6 +45,7 @@ import sys
 import json
 import time
 import argparse
+import sqlite3
 import requests
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -52,6 +53,13 @@ from zoneinfo import ZoneInfo
 ET_TZ   = ZoneInfo("America/New_York")
 API     = "https://statsapi.mlb.com/api/v1"
 API11   = "https://statsapi.mlb.com/api/v1.1"
+
+# All persistent state lives under DATA_DIR. Point this at a Railway VOLUME mount
+# (e.g. DATA_DIR=/data) so predictions, accuracy, caches, and the results DB
+# survive redeploys — Railway's default filesystem is ephemeral and wipes them.
+DATA_DIR = os.environ.get("DATA_DIR", "")
+def _p(name):
+    return os.path.join(DATA_DIR, name) if DATA_DIR else name
 
 PREGAME_WEBHOOK_URL   = os.environ.get("PREGAME_WEBHOOK_URL")
 ANTHROPIC_API_KEY     = os.environ.get("ANTHROPIC_API_KEY")
@@ -61,17 +69,18 @@ LEAD_MINUTES          = int(os.environ.get("LEAD_MINUTES", "60"))    # serve mod
 POLL_MINUTES          = int(os.environ.get("POLL_MINUTES", "10"))    # serve mode: how often the scheduler checks
 GAME_TOP_N            = int(os.environ.get("GAME_TOP_N", "5"))       # max picks per per-game embed
 POST_MIN_SCORE        = int(os.environ.get("POST_MIN_SCORE", "60"))  # serve mode: only ping a game if its top pick >= this
-POSTED_STATE_PATH     = os.environ.get("POSTED_STATE_PATH", "pregame_posted.json")
+POSTED_STATE_PATH     = os.environ.get("POSTED_STATE_PATH", _p("pregame_posted.json"))
 RESULTS_HOUR_ET       = int(os.environ.get("RESULTS_HOUR_ET", "3"))   # serve mode: grade the prior day at ~this hour
-PREDICTIONS_PATH      = os.environ.get("PREDICTIONS_PATH", "pregame_predictions.json")
-ACCURACY_PATH         = os.environ.get("ACCURACY_PATH", "pregame_accuracy.json")
+PREDICTIONS_PATH      = os.environ.get("PREDICTIONS_PATH", _p("pregame_predictions.json"))
+ACCURACY_PATH         = os.environ.get("ACCURACY_PATH", _p("pregame_accuracy.json"))
+RESULTS_DB_PATH       = os.environ.get("RESULTS_DB_PATH", _p("pregame_results.db"))
 TOP_N                 = int(os.environ.get("TOP_N", "10"))
 MIN_SCORE             = int(os.environ.get("MIN_SCORE", "55"))       # hide picks below this confidence
 SEASON                = int(os.environ.get("SEASON", str(datetime.now(ET_TZ).year)))
 
 # Disk caches so re-runs (and bench lookups) don't re-hit the API.
-PLAYER_CACHE_PATH  = os.environ.get("PLAYER_CACHE_PATH",  f"pregame_players_{SEASON}.json")
-MANAGER_CACHE_PATH = os.environ.get("MANAGER_CACHE_PATH", "pregame_manager_tendency.json")
+PLAYER_CACHE_PATH  = os.environ.get("PLAYER_CACHE_PATH",  _p(f"pregame_players_{SEASON}.json"))
+MANAGER_CACHE_PATH = os.environ.get("MANAGER_CACHE_PATH", _p("pregame_manager_tendency.json"))
 
 _session = requests.Session()
 
@@ -724,6 +733,7 @@ def run_scheduler():
                         "hydrate": "probablePitcher,team"})
             games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
             mgr = manager_tendency(today)                 # cached per date
+            db_snapshot_manager(today, mgr)               # historical coach-tendency snapshot
             posted = set(_load(POSTED_STATE_PATH).get(today, []))
             now = datetime.now(timezone.utc)
 
@@ -775,8 +785,97 @@ def run_scheduler():
 # The betting thesis is "fewer ABs than the market assumes." So a pick "HITS" if
 # the player was pinch-hit for OR got <= 3 PA (the under had a real shot). We also
 # record actual PA / H / R / RBI so you can see whether the lines would have cashed.
+# ── SQLite results database ───────────────────────────────────────────────────
+# A queryable record of every pick: the prediction (score, scenario, WHY it was
+# flagged) plus the actual outcome — so "why are we losing" is answerable with SQL.
+# Plus a daily snapshot of coach pinch-hit tendencies for historical analysis.
+def _db():
+    conn = sqlite3.connect(RESULTS_DB_PATH, timeout=10)
+    conn.execute("""CREATE TABLE IF NOT EXISTS picks(
+        date TEXT, game_pk INTEGER, pid INTEGER, name TEXT, team TEXT, opp TEXT,
+        sp_name TEXT, sp_hand TEXT, score INTEGER, scenario TEXT, bats TEXT,
+        batting_order INTEGER, reasons TEXT, posted_at TEXT,
+        graded INTEGER DEFAULT 0, pa INTEGER, ab INTEGER, h INTEGER, r INTEGER,
+        rbi INTEGER, hrr INTEGER, pulled INTEGER, hit INTEGER, outcome_note TEXT,
+        PRIMARY KEY(date, game_pk, pid))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS manager_tendency(
+        date TEXT, team_id INTEGER, subs INTEGER, games INTEGER, rate REAL, tier TEXT,
+        PRIMARY KEY(date, team_id))""")
+    return conn
+
+def db_record_picks(date_str, cands):
+    if not cands:
+        return
+    try:
+        conn = _db()
+        now = datetime.now(timezone.utc).isoformat()
+        for c in cands:
+            conn.execute(
+                """INSERT OR IGNORE INTO picks
+                   (date,game_pk,pid,name,team,opp,sp_name,sp_hand,score,scenario,
+                    bats,batting_order,reasons,posted_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (date_str, c.get("gamePk"), c.get("pid"), c.get("name"), c.get("team"),
+                 c.get("opp"), c.get("sp_name"), c.get("sp_hand"), c.get("score"),
+                 c.get("scenario"), c.get("bats"), c.get("order"),
+                 json.dumps(c.get("reasons", [])), now))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[db] record picks error: {e}")
+
+def db_record_outcome(date_str, game_pk, pid, a, hit, note):
+    try:
+        conn = _db()
+        hrr = (a.get("h", 0) + a.get("r", 0) + a.get("rbi", 0))
+        conn.execute(
+            """UPDATE picks SET graded=1,pa=?,ab=?,h=?,r=?,rbi=?,hrr=?,pulled=?,hit=?,outcome_note=?
+               WHERE date=? AND game_pk=? AND pid=?""",
+            (a.get("pa"), a.get("ab"), a.get("h"), a.get("r"), a.get("rbi"), hrr,
+             1 if a.get("pulled") else 0, 1 if hit else 0, note, date_str, game_pk, pid))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[db] outcome error: {e}")
+
+def db_snapshot_manager(date_str, mgr):
+    if not mgr:
+        return
+    try:
+        conn = _db()
+        for tid, m in mgr.items():
+            conn.execute(
+                """INSERT OR REPLACE INTO manager_tendency(date,team_id,subs,games,rate,tier)
+                   VALUES(?,?,?,?,?,?)""",
+                (date_str, int(tid), m.get("subs"), m.get("games"), m.get("rate"), m.get("tier")))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[db] manager snapshot error: {e}")
+
+def db_stats():
+    """Print hit-rate breakdowns from the results DB (the payoff of storing it)."""
+    try:
+        conn = _db(); cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), COALESCE(SUM(hit),0) FROM picks WHERE graded=1")
+        tot, hits = cur.fetchone()
+        if not tot:
+            print("No graded picks in the database yet."); conn.close(); return
+        print(f"OVERALL: {hits}/{tot} hit ({hits/tot*100:.0f}%)  [hit = pinch-hit for or ≤3 PA]\n")
+        print("By scenario:")
+        for s, n, h in cur.execute(
+                "SELECT scenario,COUNT(*),COALESCE(SUM(hit),0) FROM picks WHERE graded=1 GROUP BY scenario"):
+            print(f"  {s:<14} {h}/{n} ({h/n*100:.0f}%)")
+        print("\nBy confidence band:")
+        for lo, hi in ((80, 100), (70, 79), (60, 69), (55, 59)):
+            cur.execute("SELECT COUNT(*),COALESCE(SUM(hit),0) FROM picks WHERE graded=1 AND score BETWEEN ? AND ?", (lo, hi))
+            n, h = cur.fetchone()
+            if n:
+                print(f"  {lo}-{hi}:  {h}/{n} ({h/n*100:.0f}%)")
+        conn.close()
+    except Exception as e:
+        print(f"[db] stats error: {e}")
+
 def record_predictions(date_str, cands):
     """Persist the picks the board posted, so the end-of-day job can grade them."""
+    db_record_picks(date_str, cands)   # full detail (reasons + prediction) → SQLite
     if not cands:
         return
     d = _load(PREDICTIONS_PATH)
@@ -866,6 +965,8 @@ def grade_day(date_str, to_discord=True):
             tiers[band][0] += 1 if limited else 0
             v = "✅" if limited else "❌"
             tag = "pinch-hit for, " if a["pulled"] else ""
+            note = f"{tag}{a['pa']} PA {a['h']}H {a['r']}R {a['rbi']}RBI (H+R+RBI={hrr})"
+            db_record_outcome(date_str, p["gamePk"], p["pid"], a, limited, note)  # → SQLite
             lines.append(f"{v} **{p['name']}** ({p['team']}, {p['score']}) — {tag}{a['pa']} PA · "
                          f"{a['h']}H {a['r']}R {a['rbi']}RBI (H+R+RBI={hrr})")
 
@@ -904,7 +1005,13 @@ def main():
     ap.add_argument("--results", nargs="?", const="__today__", default=None,
                     metavar="DATE", help="grade a day's posted picks vs actual results "
                                          "(default: yesterday). Posts to Discord.")
+    ap.add_argument("--stats", action="store_true",
+                    help="print hit-rate breakdowns from the results DB (by scenario, confidence band)")
     args = ap.parse_args()
+
+    if args.stats:
+        db_stats()
+        return
 
     if args.results is not None:
         date = args.results
