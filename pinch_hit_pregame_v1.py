@@ -65,6 +65,8 @@ PREGAME_WEBHOOK_URL   = os.environ.get("PREGAME_WEBHOOK_URL")
 ANTHROPIC_API_KEY     = os.environ.get("ANTHROPIC_API_KEY")
 MANAGER_LOOKBACK_DAYS = int(os.environ.get("MANAGER_LOOKBACK_DAYS", "14"))
 RECENCY_DAYS          = int(os.environ.get("RECENCY_DAYS", "14"))   # window for recent-form signal
+PINCH_HIST_DAYS       = int(os.environ.get("PINCH_HIST_DAYS", "14"))  # window for player pinch-hit-for history + --trend (14 trending, 21 more stable)
+TREND_TOP_N           = int(os.environ.get("TREND_TOP_N", "15"))      # rows in the --trend leaderboard
 LEAD_MINUTES          = int(os.environ.get("LEAD_MINUTES", "60"))    # serve mode: fire this many min before each game's first pitch
 POLL_MINUTES          = int(os.environ.get("POLL_MINUTES", "10"))    # serve mode: how often the scheduler checks
 GAME_TOP_N            = int(os.environ.get("GAME_TOP_N", "5"))       # max picks per per-game embed
@@ -81,6 +83,7 @@ SEASON                = int(os.environ.get("SEASON", str(datetime.now(ET_TZ).yea
 # Disk caches so re-runs (and bench lookups) don't re-hit the API.
 PLAYER_CACHE_PATH  = os.environ.get("PLAYER_CACHE_PATH",  _p(f"pregame_players_{SEASON}.json"))
 MANAGER_CACHE_PATH = os.environ.get("MANAGER_CACHE_PATH", _p("pregame_manager_tendency.json"))
+SUBS_CACHE_PATH    = os.environ.get("SUBS_CACHE_PATH",    _p("pregame_subs_scan.json"))
 
 _session = requests.Session()
 
@@ -203,80 +206,114 @@ def _to_float(x):
     except Exception:
         return None
 
-# ── manager / team recent pinch-hit tendency (reuses live-bot sub parsing) ─────
-def manager_tendency(date_str):
-    """Returns {team_id: {'subs':int,'games':int,'rate':float,'tier':str}} over the
-    last MANAGER_LOOKBACK_DAYS ending the day before date_str. Cached per date so
-    the first run of a day pays the cost once. Set MANAGER_LOOKBACK_DAYS=0 to skip."""
-    if MANAGER_LOOKBACK_DAYS <= 0:
-        return {}
-
-    cache = _load(MANAGER_CACHE_PATH)
-    ck = f"{date_str}:{MANAGER_LOOKBACK_DAYS}"
+# ── recent pinch-hit scan (one pass powers BOTH team tendency AND player history) ─
+def _scan_recent_subs(date_str, window_days):
+    """Single pass over final games in the last `window_days` (ending the day before
+    date_str). Returns {"teams": {tid: {subs,games}}, "players": {"tid|last": {...}}}.
+    Cached per (date, window) so the day's first run pays the cost once. This is the
+    shared scanner behind manager_tendency() and pinch_hit_history()."""
+    if window_days <= 0:
+        return {"teams": {}, "players": {}}
+    cache = _load(SUBS_CACHE_PATH)
+    ck = f"{date_str}:{window_days}"
     if ck in cache:
         return cache[ck]
 
     end   = datetime.strptime(date_str, "%Y-%m-%d").date() - timedelta(days=1)
-    start = end - timedelta(days=MANAGER_LOOKBACK_DAYS - 1)
-    print(f"[manager] scanning subs {start}..{end} (first run today may take a minute)...")
-
+    start = end - timedelta(days=window_days - 1)
+    print(f"[scan] pinch-hit subs {start}..{end} (first run may take a minute)...")
     try:
         sched = _get(f"{API}/schedule",
                      params={"sportId": 1, "startDate": start.strftime("%Y-%m-%d"),
                              "endDate": end.strftime("%Y-%m-%d"), "gameType": "R"})
-        game_pks = [g["gamePk"]
-                    for d in sched.get("dates", [])
-                    for g in d.get("games", [])
+        game_pks = [g["gamePk"] for d in sched.get("dates", []) for g in d.get("games", [])
                     if g.get("status", {}).get("abstractGameState") == "Final"]
     except Exception as e:
-        print(f"[manager] schedule error: {e}")
-        return {}
+        print(f"[scan] schedule error: {e}")
+        return {"teams": {}, "players": {}}
 
-    tally = {}  # team_id -> {'subs':int,'games':set}
+    teams = {}     # tid -> {"subs":int, "games":set}
+    players = {}   # "tid|last" -> {"name","team","team_id","count"}
     for pk in game_pks:
         try:
             live = _get(f"{API11}/game/{pk}/feed/live", timeout=20)
-            box  = live.get("liveData", {}).get("boxscore", {}).get("teams", {})
-            side_team = {"home": None, "away": None}
+            box = live.get("liveData", {}).get("boxscore", {}).get("teams", {})
+            side_team, side_abbr = {}, {}
             for side in ("home", "away"):
-                tid = box.get(side, {}).get("team", {}).get("id")
-                side_team[side] = tid
-                if tid is not None:
-                    tally.setdefault(tid, {"subs": 0, "games": set()})["games"].add(pk)
-            plays = live.get("liveData", {}).get("plays", {}).get("allPlays", [])
-            for play in plays:
-                half = play.get("about", {}).get("halfInning")   # 'top'/'bottom'
-                batting_side = "away" if half == "top" else "home"
-                bt = side_team.get(batting_side)
+                t = box.get(side, {}).get("team", {})
+                side_team[side] = t.get("id")
+                side_abbr[side] = t.get("abbreviation") or t.get("triCode") or str(t.get("id"))
+                if t.get("id") is not None:
+                    teams.setdefault(t["id"], {"subs": 0, "games": set()})["games"].add(pk)
+            for play in live.get("liveData", {}).get("plays", {}).get("allPlays", []):
+                half = play.get("about", {}).get("halfInning")
+                bside = "away" if half == "top" else "home"
+                bt = side_team.get(bside)
                 for ev in play.get("playEvents", []):
                     det = ev.get("details", {})
-                    desc = (det.get("description") or "").lower()
+                    desc = det.get("description") or ""
                     is_sub = ev.get("isSubstitution", False) or det.get("event") == "Offensive Substitution"
-                    if is_sub and "pinch-hitter" in desc and bt is not None:
-                        tally[bt]["subs"] += 1
+                    if is_sub and "pinch-hitter" in desc.lower() and bt is not None:
+                        teams[bt]["subs"] += 1
+                        m = re.search(r"replaces\s+(.+?)[.\n]", desc, re.IGNORECASE)
+                        if m:
+                            full = m.group(1).strip()
+                            key = f"{bt}|{_lastname(full)}"
+                            e = players.setdefault(key, {"name": full, "team": side_abbr.get(bside),
+                                                         "team_id": bt, "count": 0})
+                            e["count"] += 1
         except Exception as e:
-            print(f"[manager] game {pk} error: {e}")
+            print(f"[scan] game {pk} error: {e}")
 
-    # convert to rate + tier. Tiers are relative to the league distribution.
-    result = {}
-    rates = []
-    for tid, t in tally.items():
-        g = max(1, len(t["games"]))
+    result = {"teams": {str(tid): {"subs": t["subs"], "games": len(t["games"])}
+                        for tid, t in teams.items()},
+              "players": players}
+    cutoff = (datetime.now(ET_TZ).date() - timedelta(days=3)).strftime("%Y-%m-%d")
+    cache = {k: v for k, v in cache.items() if k.split(":")[0] >= cutoff}
+    cache[ck] = result
+    _save(SUBS_CACHE_PATH, cache)
+    return result
+
+def manager_tendency(date_str):
+    """{team_id: {subs,games,rate,tier}} over MANAGER_LOOKBACK_DAYS. Tiers are relative
+    to the league distribution. Derived from the shared scan."""
+    teams = _scan_recent_subs(date_str, MANAGER_LOOKBACK_DAYS).get("teams", {})
+    if not teams:
+        return {}
+    result, rates = {}, []
+    for tid, t in teams.items():
+        g = max(1, t["games"])
         rate = t["subs"] / g
-        result[str(tid)] = {"subs": t["subs"], "games": g, "rate": round(rate, 2)}
+        result[tid] = {"subs": t["subs"], "games": g, "rate": round(rate, 2)}
         rates.append(rate)
     rates.sort()
     def pct(p):
-        if not rates:
-            return 0
-        return rates[min(len(rates) - 1, int(p * len(rates)))]
+        return rates[min(len(rates) - 1, int(p * len(rates)))] if rates else 0
     hi, lo = pct(0.66), pct(0.33)
     for tid, r in result.items():
         r["tier"] = "high" if r["rate"] >= hi else ("low" if r["rate"] <= lo else "med")
-
-    cache[ck] = result
-    _save(MANAGER_CACHE_PATH, cache)
     return result
+
+_TEAM_ABBR = {}
+def _team_abbr(tid):
+    """team_id -> abbreviation (e.g. 116 -> DET). Lazy-loaded once from /teams."""
+    if not _TEAM_ABBR:
+        try:
+            for t in _get(f"{API}/teams", params={"sportId": 1}).get("teams", []):
+                _TEAM_ABBR[t["id"]] = t.get("abbreviation") or t.get("teamCode") or str(t["id"])
+        except Exception:
+            pass
+    return _TEAM_ABBR.get(tid, str(tid))
+
+def pinch_hit_history(date_str, window_days=None):
+    """Ranked list of players pinch-hit for in the window (most-pulled first):
+    [{name, team, team_id, count, key}]. Powers the player signal + --trend board."""
+    window_days = window_days or PINCH_HIST_DAYS
+    players = _scan_recent_subs(date_str, window_days).get("players", {})
+    rows = [{"name": e["name"], "team": _team_abbr(e.get("team_id")), "team_id": e.get("team_id"),
+             "count": e["count"], "key": k} for k, e in players.items()]
+    rows.sort(key=lambda r: r["count"], reverse=True)
+    return rows
 
 # ── scoring ───────────────────────────────────────────────────────────────────
 def classify_matchup(prof, sp_hand):
@@ -304,7 +341,8 @@ def classify_matchup(prof, sp_hand):
         return "flip"
     return "none"
 
-def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario, pen_mix=None, bvp=None):
+def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
+                  pen_mix=None, bvp=None, player_ph_count=0):
     """Return (score 0-100, reasons[list]). Higher = more likely lifted = better under."""
     reasons = []
     score = 0.0
@@ -396,6 +434,14 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
             reasons.append(f"Career vs {sp_name}: {_fmt(bvp.get('avg'))} AVG ({ab} AB)")
     elif bvp and bvp.get("ab", 0) > 0:
         reasons.append(f"Career vs {sp_name}: limited history ({bvp['ab']} AB)")
+
+    # Player's OWN recent pinch-hit-for history — has THIS guy been getting pulled?
+    if player_ph_count >= 2:
+        score += min(10.0, player_ph_count * 3.0)
+        reasons.append(f"Pinch-hit for {player_ph_count}× in last {PINCH_HIST_DAYS}d — "
+                       f"repeatedly pulled lately")
+    elif player_ph_count == 1:
+        reasons.append(f"Pinch-hit for once in last {PINCH_HIST_DAYS}d")
 
     if bench_note:
         score += 18
@@ -520,11 +566,13 @@ def active_hitters(team_id):
         print(f"[roster] team {team_id} error: {e}")
     return out
 
-def analyze_game(g, mgr, lineup=None):
+def analyze_game(g, mgr, lineup=None, ph_hist=None):
     """Score every starter in a single game. Uses the OFFICIAL batting-order lineup
     (confirmed_lineup) — not the schedule's predicted feed — so non-starters can't
-    slip in. Returns candidates sorted by score."""
+    slip in. `ph_hist` is {"tid|last": count} of recent pinch-hits. Returns candidates
+    sorted by score."""
     candidates = []
+    ph_hist = ph_hist or {}
     if lineup is None:
         lineup = confirmed_lineup(g.get("gamePk"))
     for side, opp_side in (("away", "home"), ("home", "away")):
@@ -559,8 +607,9 @@ def analyze_game(g, mgr, lineup=None):
             elif scenario == "flip":
                 bench_note = find_bench_upgrade(prof.get(opp, {}).get("ops"), bats, bench)
             bvp = get_bvp(s["id"], sp_id) if sp_id else None
+            ph_count = ph_hist.get(f"{team['id']}|{_lastname(prof.get('name') or s.get('fullName'))}", 0)
             score, reasons = score_starter(prof, sp_hand, sp_name, order, tier,
-                                           bench_note, scenario, pen_mix, bvp)
+                                           bench_note, scenario, pen_mix, bvp, ph_count)
             if score >= MIN_SCORE:
                 candidates.append({
                     "score": score, "name": prof.get("name") or s.get("fullName"),
@@ -579,10 +628,11 @@ def build_board(date_str, limit=None):
     """Whole-slate board (manual/--print mode)."""
     games = get_slate(date_str, limit)
     mgr   = manager_tendency(date_str)
+    ph_hist = {r["key"]: r["count"] for r in pinch_hit_history(date_str)}
     print(f"[slate] {date_str}: {len(games)} game(s) considered")
     candidates = []
     for g in games:
-        candidates.extend(analyze_game(g, mgr))
+        candidates.extend(analyze_game(g, mgr, ph_hist=ph_hist))
     _save(PLAYER_CACHE_PATH, _player_cache)
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates[:TOP_N]
@@ -710,6 +760,29 @@ def post_game_embed(g, cands, when_str):
         "footer": {"text": "Pinch-hit model · review and forward your picks"},
     })
 
+def trend_board(date_str, to_discord=True):
+    """Leaderboard of players most often pinch-hit for over the last PINCH_HIST_DAYS.
+    Snapshots to the DB and (optionally) posts a Discord embed."""
+    rows = pinch_hit_history(date_str)
+    db_snapshot_pinch_history(date_str, PINCH_HIST_DAYS, rows)
+    rows = rows[:TREND_TOP_N]
+    if not rows:
+        print(f"[trend] no pinch-hit history in the last {PINCH_HIST_DAYS} days.")
+        return
+    lines = [f"{i}. **{r['name']}** ({r['team']}) — pinch-hit for **{r['count']}×**"
+             for i, r in enumerate(rows, 1)]
+    body = "\n".join(lines)
+    if to_discord and PREGAME_WEBHOOK_URL:
+        _post_embed({
+            "title": f"📋 Pinch-hit trend — last {PINCH_HIST_DAYS} days",
+            "description": "Players most often lifted for a pinch-hitter (repeat under targets).\n\n" + body[:3800],
+            "color": 0x5865F2,
+            "footer": {"text": f"Rolling {PINCH_HIST_DAYS}-day window"},
+        })
+        print(f"[trend] posted leaderboard ({len(rows)} players).")
+    else:
+        print(f"Pinch-hit trend — last {PINCH_HIST_DAYS}d\n" + body)
+
 # ── per-game scheduler (serve mode) ───────────────────────────────────────────
 def _mark_posted(date_str, pk):
     d = _load(POSTED_STATE_PATH)
@@ -746,6 +819,8 @@ def run_scheduler():
             games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
             mgr = manager_tendency(today)                 # cached per date
             db_snapshot_manager(today, mgr)               # historical coach-tendency snapshot
+            ph_rows = pinch_hit_history(today)            # player pinch-hit history (shared scan)
+            ph_hist = {r["key"]: r["count"] for r in ph_rows}
             posted = set(_load(POSTED_STATE_PATH).get(today, []))
             now = datetime.now(timezone.utc)
 
@@ -768,7 +843,7 @@ def run_scheduler():
                 if len(lineup["away"]) < 9 or len(lineup["home"]) < 9:
                     continue                             # official card not posted yet — retry next poll
                 when = _fmt_local(first) if first else "TBD"
-                cands = analyze_game(g, mgr, lineup)
+                cands = analyze_game(g, mgr, lineup, ph_hist)
                 _save(PLAYER_CACHE_PATH, _player_cache)
                 _mark_posted(today, pk); posted.add(pk)  # analyzed — don't repeat this game
                 a = g["teams"]["away"]["team"].get("abbreviation")
@@ -781,7 +856,7 @@ def run_scheduler():
                 else:
                     print(f"[serve] skipped {a} @ {h} — top {top} < {POST_MIN_SCORE} (no ping)")
 
-            # Daily grading: once past RESULTS_HOUR_ET, grade the prior day (once).
+            # Daily grading + trend leaderboard: once past RESULTS_HOUR_ET (once/day).
             now_et = datetime.now(ET_TZ)
             if now_et.hour >= RESULTS_HOUR_ET:
                 yday = (now_et.date() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -789,6 +864,7 @@ def run_scheduler():
                 if yday not in graded:
                     print(f"[results] grading {yday}...")
                     grade_day(yday)
+                    trend_board(today)          # post the daily "most pinch-hit-for" leaderboard
         except Exception as e:
             print(f"[serve] loop error: {e}")
         time.sleep(POLL_MINUTES * 60)
@@ -813,7 +889,24 @@ def _db():
     conn.execute("""CREATE TABLE IF NOT EXISTS manager_tendency(
         date TEXT, team_id INTEGER, subs INTEGER, games INTEGER, rate REAL, tier TEXT,
         PRIMARY KEY(date, team_id))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS pinch_hit_history(
+        date TEXT, window_days INTEGER, name TEXT, team TEXT, team_id INTEGER, count INTEGER,
+        PRIMARY KEY(date, window_days, name, team_id))""")
     return conn
+
+def db_snapshot_pinch_history(date_str, window_days, rows):
+    if not rows:
+        return
+    try:
+        conn = _db()
+        for r in rows:
+            conn.execute(
+                """INSERT OR REPLACE INTO pinch_hit_history(date,window_days,name,team,team_id,count)
+                   VALUES(?,?,?,?,?,?)""",
+                (date_str, window_days, r["name"], r.get("team"), r.get("team_id"), r["count"]))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[db] pinch-history snapshot error: {e}")
 
 def db_record_picks(date_str, cands):
     if not cands:
@@ -1019,10 +1112,18 @@ def main():
                                          "(default: yesterday). Posts to Discord.")
     ap.add_argument("--stats", action="store_true",
                     help="print hit-rate breakdowns from the results DB (by scenario, confidence band)")
+    ap.add_argument("--trend", nargs="?", const="__today__", default=None, metavar="DATE",
+                    help="leaderboard of players most pinch-hit for over the last PINCH_HIST_DAYS; "
+                         "posts to Discord (default date: today)")
     args = ap.parse_args()
 
     if args.stats:
         db_stats()
+        return
+
+    if args.trend is not None:
+        date = args.trend if args.trend != "__today__" else datetime.now(ET_TZ).strftime("%Y-%m-%d")
+        trend_board(date, to_discord=not args.print_only)
         return
 
     if args.results is not None:
