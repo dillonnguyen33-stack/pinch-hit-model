@@ -712,8 +712,9 @@ def _mark_posted(date_str, pk):
     _save(POSTED_STATE_PATH, d)
 
 def run_scheduler():
-    print(f"[serve] Pregame scheduler up — fires ~{LEAD_MINUTES}m before each game's first "
-          f"pitch, once its lineup posts. Polls every {POLL_MINUTES}m.")
+    print(f"[serve] Pregame scheduler up — analyzes each game the moment MLB posts its "
+          f"official lineup (both batting orders). Polls every {POLL_MINUTES}m. "
+          f"Pings only when top confidence ≥ {POST_MIN_SCORE}.")
     if not PREGAME_WEBHOOK_URL:
         print("[serve][warn] PREGAME_WEBHOOK_URL not set — embeds will print to console.")
     while True:
@@ -735,19 +736,16 @@ def run_scheduler():
                     _mark_posted(today, pk); posted.add(pk)
                     continue
                 gd = g.get("gameDate")
-                if not gd:
-                    continue
                 try:
-                    first = datetime.fromisoformat(gd.replace("Z", "+00:00"))
+                    first = datetime.fromisoformat(gd.replace("Z", "+00:00")) if gd else None
                 except Exception:
-                    continue
-                mins_to = (first - now).total_seconds() / 60.0
-                if mins_to > LEAD_MINUTES:               # not within the lead window yet
-                    continue
-                # within the window: wait for the OFFICIAL lineup (both batting orders set)
+                    first = None
+                # Fire AS SOON AS the official lineup drops — no fixed lead time. MLB
+                # posts these ~2-4h out; acting immediately gives the most time to shop.
                 lineup = confirmed_lineup(pk)
                 if len(lineup["away"]) < 9 or len(lineup["home"]) < 9:
                     continue                             # official card not posted yet — retry next poll
+                when = _fmt_local(first) if first else "TBD"
                 cands = analyze_game(g, mgr, lineup)
                 _save(PLAYER_CACHE_PATH, _player_cache)
                 _mark_posted(today, pk); posted.add(pk)  # analyzed — don't repeat this game
@@ -755,7 +753,7 @@ def run_scheduler():
                 h = g["teams"]["home"]["team"].get("abbreviation")
                 top = cands[0]["score"] if cands else 0
                 if top >= POST_MIN_SCORE:                # only PING when there's a real candidate
-                    post_game_embed(g, cands, _fmt_local(first))
+                    post_game_embed(g, cands, when)
                     record_predictions(today, cands[:GAME_TOP_N])
                     print(f"[serve] posted {a} @ {h} — top {top}, {len(cands)} pick(s)")
                 else:
