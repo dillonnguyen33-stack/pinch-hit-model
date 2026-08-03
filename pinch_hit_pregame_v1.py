@@ -44,6 +44,8 @@ import re
 import sys
 import json
 import time
+import io
+import csv
 import argparse
 import sqlite3
 import requests
@@ -84,6 +86,7 @@ SEASON                = int(os.environ.get("SEASON", str(datetime.now(ET_TZ).yea
 PLAYER_CACHE_PATH  = os.environ.get("PLAYER_CACHE_PATH",  _p(f"pregame_players_{SEASON}.json"))
 MANAGER_CACHE_PATH = os.environ.get("MANAGER_CACHE_PATH", _p("pregame_manager_tendency.json"))
 SUBS_CACHE_PATH    = os.environ.get("SUBS_CACHE_PATH",    _p("pregame_subs_scan.json"))
+STATCAST_CACHE_PATH = os.environ.get("STATCAST_CACHE_PATH", _p("pregame_statcast.json"))
 
 _session = requests.Session()
 
@@ -118,7 +121,85 @@ def _fmt(x):
     except Exception:
         return str(x)
 
+# ── Statcast expected stats (#1) — overall xwOBA per hitter (quality + luck) ──────
+# Source: Baseball Savant expected-stats leaderboard (free, separate from StatsAPI).
+# It's OVERALL (not platoon-split) — used as a stable talent read: weak bats are more
+# pull-prone, strong bats get kept. Loaded once/day, cached to disk.
+_statcast = None
+def _load_statcast():
+    global _statcast
+    if _statcast is not None:
+        return _statcast
+    today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+    disk = _load(STATCAST_CACHE_PATH)
+    if disk.get("date") == today and disk.get("data"):
+        _statcast = {int(k): v for k, v in disk["data"].items()}
+        return _statcast
+    data = {}
+    try:
+        r = _session.get("https://baseballsavant.mlb.com/leaderboard/expected_statistics",
+                         params={"type": "batter", "year": SEASON, "min": "1", "csv": "true"},
+                         headers={"User-Agent": "Mozilla/5.0 (pinch-hit-model)"}, timeout=30)
+        r.raise_for_status()
+        rd = csv.DictReader(io.StringIO(r.content.decode("utf-8-sig")))
+        for row in rd:
+            try:
+                pid = int(row.get("player_id"))
+                xw = _to_float(row.get("est_woba"))
+                if pid and xw is not None:
+                    data[pid] = {"xwoba": xw, "woba": _to_float(row.get("woba"))}
+            except Exception:
+                continue
+        print(f"[statcast] loaded xwOBA for {len(data)} hitters")
+    except Exception as e:
+        print(f"[statcast] load error: {e}")
+    _statcast = data
+    _save(STATCAST_CACHE_PATH, {"date": today, "data": {str(k): v for k, v in data.items()}})
+    return _statcast
+
+def statcast_xwoba(pid):
+    return _load_statcast().get(int(pid), {})
+
 # ── player profile: handedness + platoon splits (cached) ──────────────────────
+PRIOR_WEIGHT = float(os.environ.get("PRIOR_WEIGHT", "0.6"))   # weight on prior season when blending
+
+def _fetch_splits(pid, season):
+    """Return {'vl':{ops,avg,pa}, 'vr':{ops,avg,pa}} for one season (empty if none)."""
+    out = {"vl": {"ops": None, "avg": None, "pa": 0}, "vr": {"ops": None, "avg": None, "pa": 0}}
+    try:
+        data = _get(f"{API}/people/{pid}/stats",
+                    params={"stats": "statSplits", "sitCodes": "vl,vr", "group": "hitting", "season": season})
+        for s in data.get("stats", []):
+            for spl in s.get("splits", []):
+                code = spl.get("split", {}).get("code")
+                st = spl.get("stat", {})
+                if code in ("vl", "vr"):
+                    out[code] = {"ops": _to_float(st.get("ops")), "avg": _to_float(st.get("avg")),
+                                 "pa": int(st.get("plateAppearances") or 0)}
+    except Exception as e:
+        print(f"[splits] {pid} {season} error: {e}")
+    return out
+
+def _blend(c, p):
+    """PA-weighted blend of a current-season split (c) with prior season (p), prior
+    discounted by PRIOR_WEIGHT. Stabilizes small current-season samples. `pa` = current
+    PA (for display), `pa_eff` = effective blended sample (for the noise guard)."""
+    cpa, ppa = c.get("pa") or 0, p.get("pa") or 0
+    co, po = c.get("ops"), p.get("ops")
+    if co is None and po is None:
+        return {"ops": None, "avg": c.get("avg"), "pa": cpa, "pa_eff": cpa, "blended": False}
+    if co is None:
+        return {"ops": po, "avg": p.get("avg"), "pa": cpa, "pa_eff": ppa, "blended": True}
+    if po is None or ppa == 0:
+        return {"ops": co, "avg": c.get("avg"), "pa": cpa, "pa_eff": cpa, "blended": False}
+    wprev = ppa * PRIOR_WEIGHT
+    denom = cpa + wprev
+    bo = (co * cpa + po * wprev) / denom
+    ca, pa2 = c.get("avg"), p.get("avg")
+    ba = (ca * cpa + pa2 * wprev) / denom if (ca is not None and pa2 is not None) else ca
+    return {"ops": round(bo, 3), "avg": round(ba, 3) if ba is not None else None,
+            "pa": cpa, "pa_eff": cpa + ppa, "blended": True}
+
 def get_hitter_profile(pid, name=None):
     """Returns {name, bats: L/R/S, vl:{ops,avg,pa}, vr:{ops,avg,pa}}. Cached to disk,
     but REFRESHED DAILY — splits change as the season goes, so a cache entry is only
@@ -139,22 +220,17 @@ def get_hitter_profile(pid, name=None):
     except Exception as e:
         print(f"[profile] handedness error {pid}: {e}")
 
-    try:
-        data = _get(f"{API}/people/{pid}/stats",
-                    params={"stats": "statSplits", "sitCodes": "vl,vr",
-                            "group": "hitting", "season": SEASON})
-        for s in data.get("stats", []):
-            for spl in s.get("splits", []):
-                code = spl.get("split", {}).get("code")     # 'vl' or 'vr'
-                st   = spl.get("stat", {})
-                if code in ("vl", "vr"):
-                    prof[code] = {
-                        "ops": _to_float(st.get("ops")),
-                        "avg": _to_float(st.get("avg")),
-                        "pa":  int(st.get("plateAppearances") or 0),
-                    }
-    except Exception as e:
-        print(f"[profile] splits error {pid}: {e}")
+    # platoon splits — current season BLENDED with prior season to stabilize small
+    # samples (#3). When current PA is thin, prior-year data fills in the read.
+    cur  = _fetch_splits(pid, SEASON)
+    prev = _fetch_splits(pid, SEASON - 1)
+    for code in ("vl", "vr"):
+        prof[code] = _blend(cur[code], prev[code])
+
+    # Statcast overall xwOBA (#1) — stable talent read (quality/luck).
+    sc = statcast_xwoba(pid)
+    prof["xwoba"] = sc.get("xwoba")
+    prof["woba"]  = sc.get("woba")
 
     # recency: last RECENCY_DAYS of form (batter-only, refreshed daily with profile).
     prof["recent_ops"] = None
@@ -213,7 +289,7 @@ def _scan_recent_subs(date_str, window_days):
     Cached per (date, window) so the day's first run pays the cost once. This is the
     shared scanner behind manager_tendency() and pinch_hit_history()."""
     if window_days <= 0:
-        return {"teams": {}, "players": {}}
+        return {"teams": {}, "players": {}, "pitchers": {}}
     cache = _load(SUBS_CACHE_PATH)
     ck = f"{date_str}:{window_days}"
     if ck in cache:
@@ -222,22 +298,29 @@ def _scan_recent_subs(date_str, window_days):
     end   = datetime.strptime(date_str, "%Y-%m-%d").date() - timedelta(days=1)
     start = end - timedelta(days=window_days - 1)
     print(f"[scan] pinch-hit subs {start}..{end} (first run may take a minute)...")
+    pk_date = {}
     try:
         sched = _get(f"{API}/schedule",
                      params={"sportId": 1, "startDate": start.strftime("%Y-%m-%d"),
                              "endDate": end.strftime("%Y-%m-%d"), "gameType": "R"})
-        game_pks = [g["gamePk"] for d in sched.get("dates", []) for g in d.get("games", [])
-                    if g.get("status", {}).get("abstractGameState") == "Final"]
+        game_pks = []
+        for d in sched.get("dates", []):
+            for g in d.get("games", []):
+                if g.get("status", {}).get("abstractGameState") == "Final":
+                    game_pks.append(g["gamePk"])
+                    pk_date[g["gamePk"]] = g.get("officialDate") or d.get("date")
     except Exception as e:
         print(f"[scan] schedule error: {e}")
-        return {"teams": {}, "players": {}}
+        return {"teams": {}, "players": {}, "pitchers": {}}
 
     teams = {}     # tid -> {"subs":int, "games":set}
     players = {}   # "tid|last" -> {"name","team","team_id","count"}
+    pitchers = {}  # pid_str -> [dates pitched]  (#2 reliever-rest)
     for pk in game_pks:
         try:
             live = _get(f"{API11}/game/{pk}/feed/live", timeout=20)
             box = live.get("liveData", {}).get("boxscore", {}).get("teams", {})
+            gdate = pk_date.get(pk)
             side_team, side_abbr = {}, {}
             for side in ("home", "away"):
                 t = box.get(side, {}).get("team", {})
@@ -245,6 +328,9 @@ def _scan_recent_subs(date_str, window_days):
                 side_abbr[side] = t.get("abbreviation") or t.get("triCode") or str(t.get("id"))
                 if t.get("id") is not None:
                     teams.setdefault(t["id"], {"subs": 0, "games": set()})["games"].add(pk)
+                for ppid in box.get(side, {}).get("pitchers", []):     # who pitched, for rest
+                    if gdate:
+                        pitchers.setdefault(str(ppid), []).append(gdate)
             for play in live.get("liveData", {}).get("plays", {}).get("allPlays", []):
                 half = play.get("about", {}).get("halfInning")
                 bside = "away" if half == "top" else "home"
@@ -267,12 +353,26 @@ def _scan_recent_subs(date_str, window_days):
 
     result = {"teams": {str(tid): {"subs": t["subs"], "games": len(t["games"])}
                         for tid, t in teams.items()},
-              "players": players}
+              "players": players,
+              "pitchers": {p: sorted(set(ds)) for p, ds in pitchers.items()}}
     cutoff = (datetime.now(ET_TZ).date() - timedelta(days=3)).strftime("%Y-%m-%d")
     cache = {k: v for k, v in cache.items() if k.split(":")[0] >= cutoff}
     cache[ck] = result
     _save(SUBS_CACHE_PATH, cache)
     return result
+
+def unavailable_relievers(date_str):
+    """Pitchers who appeared on BOTH of the last two game days (back-to-back) — a
+    reasonable 'likely gassed / down today' proxy. Returns a set of pitcher ids (#2)."""
+    pit = _scan_recent_subs(date_str, PINCH_HIST_DAYS).get("pitchers", {})
+    alldates = set()
+    for ds in pit.values():
+        alldates.update(ds)
+    recent = sorted(alldates)[-2:]
+    if len(recent) < 2:
+        return set()
+    d1, d2 = recent[-1], recent[-2]
+    return {int(pid) for pid, ds in pit.items() if d1 in ds and d2 in ds}
 
 def manager_tendency(date_str):
     """{team_id: {subs,games,rate,tier}} over MANAGER_LOOKBACK_DAYS. Tiers are relative
@@ -353,6 +453,9 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
     oo    = prof.get(opp,   {}).get("ops")
     fpa   = prof.get(faced, {}).get("pa", 0)
     opa   = prof.get(opp,   {}).get("pa", 0)
+    # effective (blended) sample drives the noise guard; current PA is for display
+    fpa_eff = prof.get(faced, {}).get("pa_eff", fpa)
+    blended = prof.get(faced, {}).get("blended", False)
     total_pa = fpa + opa
 
     if scenario == "disadvantage":
@@ -362,10 +465,13 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
         pts = min(35.0, gap / 0.200 * 35.0)
         if fo < 0.680:
             pts += min(10.0, (0.680 - fo) / 0.200 * 10.0)
-        if fpa < 30:                       # thin split = noisy; damp confidence
+        if fpa_eff < 30:                   # thin even after blending — damp confidence
             pts *= 0.5
         score += pts
-        samp = "" if fpa >= 30 else f", small sample {fpa} PA vs {sp_hand}HP"
+        if fpa_eff >= 30:
+            samp = " (blended w/ prior yr)" if blended and fpa < 30 else ""
+        else:
+            samp = f", small sample {fpa_eff} PA vs {sp_hand}HP"
         reasons.append(f"Poor matchup — bats {bats} into {sp_hand}HP: {_fmt(fo)} OPS vs "
                        f"{sp_hand}HP (vs {_fmt(oo)} opposite){samp}")
         if pen_mix and pen_mix.get("total", 0) >= 4:
@@ -434,6 +540,19 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
             reasons.append(f"Career vs {sp_name}: {_fmt(bvp.get('avg'))} AVG ({ab} AB)")
     elif bvp and bvp.get("ab", 0) > 0:
         reasons.append(f"Career vs {sp_name}: limited history ({bvp['ab']} AB)")
+
+    if pen_mix and pen_mix.get("rested_out") and scenario in ("disadvantage", "flip"):
+        reasons.append(f"({pen_mix['rested_out']} opp reliever(s) likely down — pitched back-to-back)")
+
+    # Statcast overall quality (#1): weak bats are more pull-prone; strong bats get kept.
+    xw = prof.get("xwoba")
+    if xw is not None:
+        if xw < 0.300:
+            score += 6
+            reasons.append(f"Weak overall bat ({_fmt(xw)} xwOBA, Statcast) — pull-prone")
+        elif xw > 0.360:
+            score *= 0.90
+            reasons.append(f"Strong overall bat ({_fmt(xw)} xwOBA, Statcast) — managers keep him")
 
     # Player's OWN recent pinch-hit-for history — has THIS guy been getting pulled?
     if player_ph_count >= 2:
@@ -532,11 +651,12 @@ def pitcher_hand(pid):
     _player_cache[key] = hand
     return hand
 
-def opposing_bullpen_mix(team_id, exclude_sp_id):
+def opposing_bullpen_mix(team_id, exclude_sp_id, unavailable=None):
     """L/R counts of the opposing team's AVAILABLE bullpen (active-roster pitchers
-    minus today's probable starter). Approximate — includes other rotation arms —
-    but the L/R ratio is what the model uses. Computed once per team per run."""
-    mix = {"L": 0, "R": 0, "total": 0}
+    minus today's probable starter, minus back-to-back arms that are likely down
+    today — #2). The L/R ratio is what the model uses."""
+    unavailable = unavailable or set()
+    mix = {"L": 0, "R": 0, "total": 0, "rested_out": 0}
     try:
         data = _get(f"{API}/teams/{team_id}/roster", params={"rosterType": "active"})
     except Exception as e:
@@ -545,9 +665,13 @@ def opposing_bullpen_mix(team_id, exclude_sp_id):
     for p in data.get("roster", []):
         if p.get("position", {}).get("type") != "Pitcher":
             continue
-        if p["person"]["id"] == exclude_sp_id:
+        ppid = p["person"]["id"]
+        if ppid == exclude_sp_id:
             continue
-        h = pitcher_hand(p["person"]["id"])
+        if ppid in unavailable:               # threw back-to-back — likely unavailable today
+            mix["rested_out"] += 1
+            continue
+        h = pitcher_hand(ppid)
         if h in ("L", "R"):
             mix[h] += 1
             mix["total"] += 1
@@ -566,11 +690,11 @@ def active_hitters(team_id):
         print(f"[roster] team {team_id} error: {e}")
     return out
 
-def analyze_game(g, mgr, lineup=None, ph_hist=None):
+def analyze_game(g, mgr, lineup=None, ph_hist=None, unavailable=None):
     """Score every starter in a single game. Uses the OFFICIAL batting-order lineup
     (confirmed_lineup) — not the schedule's predicted feed — so non-starters can't
-    slip in. `ph_hist` is {"tid|last": count} of recent pinch-hits. Returns candidates
-    sorted by score."""
+    slip in. `ph_hist` is {"tid|last": count} of recent pinch-hits; `unavailable` is
+    the set of gassed relievers to drop from the pen. Returns candidates sorted by score."""
     candidates = []
     ph_hist = ph_hist or {}
     if lineup is None:
@@ -593,7 +717,7 @@ def analyze_game(g, mgr, lineup=None, ph_hist=None):
 
         starter_ids = {s["id"] for s in starters}
         bench = [p for p in active_hitters(team["id"]) if p["id"] not in starter_ids]
-        pen_mix = opposing_bullpen_mix(opp_team["id"], sp_id)
+        pen_mix = opposing_bullpen_mix(opp_team["id"], sp_id, unavailable)
 
         for order, s in enumerate(starters, start=1):
             prof = get_hitter_profile(s["id"], s.get("fullName"))
@@ -629,10 +753,11 @@ def build_board(date_str, limit=None):
     games = get_slate(date_str, limit)
     mgr   = manager_tendency(date_str)
     ph_hist = {r["key"]: r["count"] for r in pinch_hit_history(date_str)}
+    unavail = unavailable_relievers(date_str)
     print(f"[slate] {date_str}: {len(games)} game(s) considered")
     candidates = []
     for g in games:
-        candidates.extend(analyze_game(g, mgr, ph_hist=ph_hist))
+        candidates.extend(analyze_game(g, mgr, ph_hist=ph_hist, unavailable=unavail))
     _save(PLAYER_CACHE_PATH, _player_cache)
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates[:TOP_N]
@@ -821,6 +946,7 @@ def run_scheduler():
             db_snapshot_manager(today, mgr)               # historical coach-tendency snapshot
             ph_rows = pinch_hit_history(today)            # player pinch-hit history (shared scan)
             ph_hist = {r["key"]: r["count"] for r in ph_rows}
+            unavail = unavailable_relievers(today)        # gassed relievers (shared scan)
             posted = set(_load(POSTED_STATE_PATH).get(today, []))
             now = datetime.now(timezone.utc)
 
@@ -843,7 +969,7 @@ def run_scheduler():
                 if len(lineup["away"]) < 9 or len(lineup["home"]) < 9:
                     continue                             # official card not posted yet — retry next poll
                 when = _fmt_local(first) if first else "TBD"
-                cands = analyze_game(g, mgr, lineup, ph_hist)
+                cands = analyze_game(g, mgr, lineup, ph_hist, unavail)
                 _save(PLAYER_CACHE_PATH, _player_cache)
                 _mark_posted(today, pk); posted.add(pk)  # analyzed — don't repeat this game
                 a = g["teams"]["away"]["team"].get("abbreviation")
