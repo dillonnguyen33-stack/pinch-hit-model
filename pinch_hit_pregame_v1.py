@@ -87,6 +87,7 @@ PLAYER_CACHE_PATH  = os.environ.get("PLAYER_CACHE_PATH",  _p(f"pregame_players_{
 MANAGER_CACHE_PATH = os.environ.get("MANAGER_CACHE_PATH", _p("pregame_manager_tendency.json"))
 SUBS_CACHE_PATH    = os.environ.get("SUBS_CACHE_PATH",    _p("pregame_subs_scan.json"))
 STATCAST_CACHE_PATH = os.environ.get("STATCAST_CACHE_PATH", _p("pregame_statcast.json"))
+PITCH_CACHE_PATH    = os.environ.get("PITCH_CACHE_PATH",    _p("pregame_pitchdata.json"))
 
 _session = requests.Session()
 
@@ -159,6 +160,111 @@ def _load_statcast():
 
 def statcast_xwoba(pid):
     return _load_statcast().get(int(pid), {})
+
+# ── Starter length (#1) — avg innings per start = how early the bullpen enters ────
+def starter_length(pid):
+    """Avg IP per start this season (opener/short-leash vs workhorse). Cached daily."""
+    if not pid:
+        return None
+    key = "len_" + str(pid)
+    today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+    c = _player_cache.get(key)
+    if isinstance(c, dict) and c.get("_date") == today:
+        return c.get("ip_gs")
+    ip_gs = None
+    try:
+        d = _get(f"{API}/people/{pid}/stats", params={"stats": "season", "group": "pitching", "season": SEASON})
+        for s in d.get("stats", []):
+            for spl in s.get("splits", []):
+                st = spl.get("stat", {})
+                gs = int(st.get("gamesStarted") or 0)
+                ip = _to_float(st.get("inningsPitched"))
+                if gs > 0 and ip:
+                    ip_gs = round(ip / gs, 2)
+    except Exception as e:
+        print(f"[len] {pid} error: {e}")
+    _player_cache[key] = {"ip_gs": ip_gs, "_date": today}
+    return ip_gs
+
+# ── Pitch-arsenal matchup (#2) — batter performance vs THIS pitcher's pitch mix ───
+# Pitcher arsenal (usage by pitch type) + batter run-value by pitch type, both from
+# Baseball Savant. Weighting the batter's performance by the pitcher's usage gives a
+# real "does this hitter handle this arsenal" read. This is a PRODUCTION signal (does
+# the under cash if he bats), complementing the pull-risk signals.
+_pitch_data = None
+_ARS_SUFFIXES = ["ff", "si", "fc", "sl", "ch", "cu", "fs", "kn", "st", "sv"]
+
+def _load_pitch_data():
+    global _pitch_data
+    if _pitch_data is not None:
+        return _pitch_data
+    today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+    disk = _load(PITCH_CACHE_PATH)
+    if disk.get("date") == today and disk.get("arsenal"):
+        _pitch_data = {"arsenal": {int(k): v for k, v in disk["arsenal"].items()},
+                       "batter": {int(k): v for k, v in disk["batter"].items()}}
+        return _pitch_data
+    UA = {"User-Agent": "Mozilla/5.0 (pinch-hit-model)"}
+    arsenal, batter = {}, {}
+    try:
+        r = _session.get("https://baseballsavant.mlb.com/leaderboard/pitch-arsenals",
+                         params={"year": SEASON, "min": "50", "type": "n_", "csv": "true"},
+                         headers=UA, timeout=30)
+        r.raise_for_status()
+        for row in csv.DictReader(io.StringIO(r.content.decode("utf-8-sig"))):
+            try:
+                pid = int(row["pitcher"])
+                counts = {s.upper(): float(row.get("n_" + s) or 0) for s in _ARS_SUFFIXES}
+                tot = sum(counts.values())
+                if tot > 0:
+                    arsenal[pid] = {pt: round(c / tot, 3) for pt, c in counts.items() if c > 0}
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[pitch] arsenal load error: {e}")
+    try:
+        r = _session.get("https://baseballsavant.mlb.com/leaderboard/pitch-arsenal-stats",
+                         params={"type": "batter", "year": SEASON, "min": "20", "csv": "true"},
+                         headers=UA, timeout=30)
+        r.raise_for_status()
+        for row in csv.DictReader(io.StringIO(r.content.decode("utf-8-sig"))):
+            try:
+                bid = int(row["player_id"]); pt = row.get("pitch_type")
+                if not pt:
+                    continue
+                batter.setdefault(bid, {})[pt] = {
+                    "rv": _to_float(row.get("run_value_per_100")),
+                    "woba": _to_float(row.get("woba")),
+                    "whiff": _to_float(row.get("whiff_percent"))}
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[pitch] batter load error: {e}")
+    _pitch_data = {"arsenal": arsenal, "batter": batter}
+    _save(PITCH_CACHE_PATH, {"date": today,
+                             "arsenal": {str(k): v for k, v in arsenal.items()},
+                             "batter": {str(k): v for k, v in batter.items()}})
+    print(f"[pitch] arsenals {len(arsenal)} pitchers, run-values {len(batter)} batters")
+    return _pitch_data
+
+_PT_NAMES = {"FF": "4-seam", "SI": "sinker", "FC": "cutter", "SL": "slider", "CH": "change",
+             "CU": "curve", "FS": "splitter", "KN": "knuckle", "ST": "sweeper", "SV": "slurve"}
+
+def arsenal_matchup(bid, pid):
+    """Batter's run value weighted by the pitcher's pitch usage. Negative wrv = the
+    hitter struggles vs this arsenal (tough). Returns {wrv, top_pt, top_frac}."""
+    d = _load_pitch_data()
+    ars = d["arsenal"].get(int(pid)); bat = d["batter"].get(int(bid))
+    if not ars or not bat:
+        return {"wrv": None}
+    wrv, wsum = 0.0, 0.0
+    for pt, frac in ars.items():
+        b = bat.get(pt)
+        if b and b.get("rv") is not None:
+            wrv += frac * b["rv"]; wsum += frac
+    top_pt, top_frac = max(ars.items(), key=lambda kv: kv[1])
+    return {"wrv": round(wrv, 2) if wsum >= 0.4 else None, "top_pt": top_pt, "top_frac": top_frac,
+            "bat_top": bat.get(top_pt)}
 
 # ── player profile: handedness + platoon splits (cached) ──────────────────────
 PRIOR_WEIGHT = float(os.environ.get("PRIOR_WEIGHT", "0.6"))   # weight on prior season when blending
@@ -442,7 +548,7 @@ def classify_matchup(prof, sp_hand):
     return "none"
 
 def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
-                  pen_mix=None, bvp=None, player_ph_count=0):
+                  pen_mix=None, bvp=None, player_ph_count=0, sp_len=None, arsenal=None):
     """Return (score 0-100, reasons[list]). Higher = more likely lifted = better under."""
     reasons = []
     score = 0.0
@@ -543,6 +649,27 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
 
     if pen_mix and pen_mix.get("rested_out") and scenario in ("disadvantage", "flip"):
         reasons.append(f"({pen_mix['rested_out']} opp reliever(s) likely down — pitched back-to-back)")
+
+    # Starter length (#1): short-leash/opener → bullpen enters early → pull happens
+    # sooner; workhorse → starter stays in → flip is less likely.
+    if sp_len is not None and scenario in ("disadvantage", "flip"):
+        if sp_len < 4.2:
+            score += 6
+            reasons.append(f"Opp starter avgs {sp_len:.1f} IP/start — early bullpen, matchup flips sooner")
+        elif sp_len > 5.5 and scenario == "flip":
+            score *= 0.90
+            reasons.append(f"Opp starter avgs {sp_len:.1f} IP/start — goes deep, flip less likely")
+
+    # Pitch-arsenal matchup (#2): does the hitter handle this pitcher's mix? PRODUCTION
+    # signal (does the under cash if he bats), not pull-risk.
+    if arsenal and arsenal.get("wrv") is not None:
+        wrv = arsenal["wrv"]
+        score += max(-8.0, min(8.0, -wrv * 6.0))   # negative wrv (struggles) → boosts under
+        pt = _PT_NAMES.get(arsenal.get("top_pt"), arsenal.get("top_pt", ""))
+        if wrv <= -0.4:
+            reasons.append(f"Tough vs {sp_name}'s arsenal ({wrv:+.1f} RV/100; heavy {pt}) — struggles vs his mix")
+        elif wrv >= 0.4:
+            reasons.append(f"Handles {sp_name}'s arsenal well ({wrv:+.1f} RV/100) — favorable, less under value")
 
     # Statcast overall quality (#1): weak bats are more pull-prone; strong bats get kept.
     xw = prof.get("xwoba")
@@ -718,6 +845,7 @@ def analyze_game(g, mgr, lineup=None, ph_hist=None, unavailable=None):
         starter_ids = {s["id"] for s in starters}
         bench = [p for p in active_hitters(team["id"]) if p["id"] not in starter_ids]
         pen_mix = opposing_bullpen_mix(opp_team["id"], sp_id, unavailable)
+        sp_len  = starter_length(sp_id)          # opposing starter's avg IP/start (#1)
 
         for order, s in enumerate(starters, start=1):
             prof = get_hitter_profile(s["id"], s.get("fullName"))
@@ -732,8 +860,9 @@ def analyze_game(g, mgr, lineup=None, ph_hist=None, unavailable=None):
                 bench_note = find_bench_upgrade(prof.get(opp, {}).get("ops"), bats, bench)
             bvp = get_bvp(s["id"], sp_id) if sp_id else None
             ph_count = ph_hist.get(f"{team['id']}|{_lastname(prof.get('name') or s.get('fullName'))}", 0)
-            score, reasons = score_starter(prof, sp_hand, sp_name, order, tier,
-                                           bench_note, scenario, pen_mix, bvp, ph_count)
+            arsenal = arsenal_matchup(s["id"], sp_id) if sp_id else None
+            score, reasons = score_starter(prof, sp_hand, sp_name, order, tier, bench_note,
+                                           scenario, pen_mix, bvp, ph_count, sp_len, arsenal)
             if score >= MIN_SCORE:
                 candidates.append({
                     "score": score, "name": prof.get("name") or s.get("fullName"),
