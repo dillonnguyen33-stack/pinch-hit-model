@@ -177,7 +177,7 @@ def starter_length(pid):
     (this bug once showed a 4.4-IP starter as 8.2). None if too few starts. Cached daily."""
     if not pid:
         return None
-    key = "len_" + str(pid)
+    key = "len_v2_" + str(pid)     # v2: bust stale cache from the old total-IP/GS bug
     today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
     c = _player_cache.get(key)
     if isinstance(c, dict) and c.get("_date") == today:
@@ -1141,9 +1141,17 @@ def run_scheduler():
     if RESCAN_ON_BOOT:
         today0 = datetime.now(ET_TZ).strftime("%Y-%m-%d")
         d = _load(POSTED_STATE_PATH); d.pop(today0, None); _save(POSTED_STATE_PATH, d)
-        print(f"[serve] RESCAN_ON_BOOT set — cleared posted-state for {today0}; every game/side "
-              f"will be re-scanned and re-posted on the first poll. REMOVE this env var afterward "
-              f"so normal restarts don't re-post the whole board.")
+        # Also drop COMPUTED caches so stale values from a prior build (e.g. a leash
+        # computed by buggy code earlier today) don't get served back from cache.
+        _player_cache.clear()
+        for pth in (PLAYER_CACHE_PATH, SUBS_CACHE_PATH):
+            try:
+                os.remove(pth)
+            except Exception:
+                pass
+        print(f"[serve] RESCAN_ON_BOOT set — cleared posted-state + computed caches for {today0}; "
+              f"every game/side will be re-scanned fresh on the first poll. REMOVE this env var "
+              f"afterward so normal restarts don't re-post the whole board.")
     while True:
         try:
             today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
