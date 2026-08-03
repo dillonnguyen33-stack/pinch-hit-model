@@ -162,8 +162,18 @@ def statcast_xwoba(pid):
     return _load_statcast().get(int(pid), {})
 
 # ── Starter length (#1) — avg innings per start = how early the bullpen enters ────
+def _parse_ip(s):
+    """MLB innings are 'X.Y' where Y is OUTS (thirds), not decimal — '4.2' = 4⅔."""
+    try:
+        w, _, f = str(s).partition(".")
+        return int(w) + (int(f or 0)) / 3.0
+    except Exception:
+        return None
+
 def starter_length(pid):
-    """Avg IP per start this season (opener/short-leash vs workhorse). Cached daily."""
+    """Avg IP over the pitcher's actual STARTS this season, from the game log. Must
+    exclude relief outings — a swingman's total IP / starts hugely overstates length
+    (this bug once showed a 4.4-IP starter as 8.2). None if too few starts. Cached daily."""
     if not pid:
         return None
     key = "len_" + str(pid)
@@ -173,14 +183,17 @@ def starter_length(pid):
         return c.get("ip_gs")
     ip_gs = None
     try:
-        d = _get(f"{API}/people/{pid}/stats", params={"stats": "season", "group": "pitching", "season": SEASON})
+        d = _get(f"{API}/people/{pid}/stats", params={"stats": "gameLog", "group": "pitching", "season": SEASON})
+        starts = []
         for s in d.get("stats", []):
             for spl in s.get("splits", []):
                 st = spl.get("stat", {})
-                gs = int(st.get("gamesStarted") or 0)
-                ip = _to_float(st.get("inningsPitched"))
-                if gs > 0 and ip:
-                    ip_gs = round(ip / gs, 2)
+                if int(st.get("gamesStarted") or 0) == 1:      # only games he started
+                    ip = _parse_ip(st.get("inningsPitched"))
+                    if ip is not None:
+                        starts.append(ip)
+        if len(starts) >= 3:                                   # need a few starts to be reliable
+            ip_gs = round(sum(starts) / len(starts), 2)
     except Exception as e:
         print(f"[len] {pid} error: {e}")
     _player_cache[key] = {"ip_gs": ip_gs, "_date": today}
@@ -653,10 +666,10 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
     # Starter length (#1): short-leash/opener → bullpen enters early → pull happens
     # sooner; workhorse → starter stays in → flip is less likely.
     if sp_len is not None and scenario in ("disadvantage", "flip"):
-        if sp_len < 4.2:
+        if sp_len < 4.6:                       # short/opener (league avg ~5.2) → early bullpen
             score += 6
-            reasons.append(f"Opp starter avgs {sp_len:.1f} IP/start — early bullpen, matchup flips sooner")
-        elif sp_len > 5.5 and scenario == "flip":
+            reasons.append(f"Opp starter avgs {sp_len:.1f} IP/start — short outing, early bullpen, matchup flips sooner")
+        elif sp_len > 6.0 and scenario == "flip":
             score *= 0.90
             reasons.append(f"Opp starter avgs {sp_len:.1f} IP/start — goes deep, flip less likely")
 
