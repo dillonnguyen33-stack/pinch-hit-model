@@ -796,12 +796,36 @@ def pitcher_hand(pid):
     _player_cache[key] = hand
     return hand
 
+def pitcher_role(pid):
+    """'SP' if this pitcher is a rotation-only starter (won't come out of the pen),
+    else 'PEN' (reliever or swingman who DOES relieve). Keeps swingmen in the bullpen.
+    Cached daily."""
+    key = "role_" + str(pid)
+    today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+    c = _player_cache.get(key)
+    if isinstance(c, dict) and c.get("_date") == today:
+        return c.get("role")
+    role = "PEN"
+    try:
+        d = _get(f"{API}/people/{pid}/stats", params={"stats": "season", "group": "pitching", "season": SEASON})
+        for s in d.get("stats", []):
+            for spl in s.get("splits", []):
+                st = spl.get("stat", {})
+                gs = int(st.get("gamesStarted") or 0)
+                g  = int(st.get("gamesPlayed") or 0)
+                if g > 0 and gs >= 4 and gs / g > 0.65:   # nearly all appearances are starts → rotation
+                    role = "SP"
+    except Exception:
+        pass
+    _player_cache[key] = {"role": role, "_date": today}
+    return role
+
 def opposing_bullpen_mix(team_id, exclude_sp_id, unavailable=None):
-    """L/R counts of the opposing team's AVAILABLE bullpen (active-roster pitchers
-    minus today's probable starter, minus back-to-back arms that are likely down
-    today — #2). The L/R ratio is what the model uses."""
+    """L/R counts of the opposing team's AVAILABLE bullpen. Excludes: today's probable
+    starter, rotation-only starters who won't relieve (keeps swingmen), and back-to-back
+    arms likely down today. The result reflects who can actually pitch in relief."""
     unavailable = unavailable or set()
-    mix = {"L": 0, "R": 0, "total": 0, "rested_out": 0}
+    mix = {"L": 0, "R": 0, "total": 0, "rested_out": 0, "rotation_out": 0}
     try:
         data = _get(f"{API}/teams/{team_id}/roster", params={"rosterType": "active"})
     except Exception as e:
@@ -812,6 +836,9 @@ def opposing_bullpen_mix(team_id, exclude_sp_id, unavailable=None):
             continue
         ppid = p["person"]["id"]
         if ppid == exclude_sp_id:
+            continue
+        if pitcher_role(ppid) == "SP":        # rotation starter, not pitching today → not the pen
+            mix["rotation_out"] += 1
             continue
         if ppid in unavailable:               # threw back-to-back — likely unavailable today
             mix["rested_out"] += 1
