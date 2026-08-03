@@ -481,17 +481,28 @@ def _scan_recent_subs(date_str, window_days):
     return result
 
 def unavailable_relievers(date_str):
-    """Pitchers who appeared on BOTH of the last two game days (back-to-back) — a
-    reasonable 'likely gassed / down today' proxy. Returns a set of pitcher ids (#2)."""
+    """Pitchers who threw 3+ CONSECUTIVE days ending at the most recent game day —
+    genuinely fatigued / likely down today. A normal back-to-back (2 straight) is fine
+    and stays in the pen. Returns a set of pitcher ids (#2)."""
     pit = _scan_recent_subs(date_str, PINCH_HIST_DAYS).get("pitchers", {})
     alldates = set()
     for ds in pit.values():
         alldates.update(ds)
-    recent = sorted(alldates)[-2:]
-    if len(recent) < 2:
+    if not alldates:
         return set()
-    d1, d2 = recent[-1], recent[-2]
-    return {int(pid) for pid, ds in pit.items() if d1 in ds and d2 in ds}
+    latest = max(alldates)
+    out = set()
+    for pid, ds in pit.items():
+        dss = set(ds)
+        if latest not in dss:                 # rested most recent day → available
+            continue
+        streak = 1
+        base = datetime.strptime(latest, "%Y-%m-%d").date()
+        while (base - timedelta(days=streak)).strftime("%Y-%m-%d") in dss:
+            streak += 1
+        if streak >= 3:                        # 3+ straight days → likely unavailable
+            out.add(int(pid))
+    return out
 
 def manager_tendency(date_str):
     """{team_id: {subs,games,rate,tier}} over MANAGER_LOOKBACK_DAYS. Tiers are relative
@@ -661,7 +672,7 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
         reasons.append(f"Career vs {sp_name}: limited history ({bvp['ab']} AB)")
 
     if pen_mix and pen_mix.get("rested_out") and scenario in ("disadvantage", "flip"):
-        reasons.append(f"({pen_mix['rested_out']} opp reliever(s) likely down — pitched back-to-back)")
+        reasons.append(f"({pen_mix['rested_out']} opp reliever(s) likely down — pitched 3+ straight days)")
 
     # Starter length (#1): short-leash/opener → bullpen enters early → pull happens
     # sooner; workhorse → starter stays in → flip is less likely.
