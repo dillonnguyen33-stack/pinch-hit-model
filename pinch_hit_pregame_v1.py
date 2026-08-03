@@ -73,6 +73,7 @@ LEAD_MINUTES          = int(os.environ.get("LEAD_MINUTES", "60"))    # serve mod
 POLL_MINUTES          = int(os.environ.get("POLL_MINUTES", "5"))     # serve mode: how often the scheduler checks for new lineups
 GAME_TOP_N            = int(os.environ.get("GAME_TOP_N", "5"))       # max picks per per-game embed
 POST_MIN_SCORE        = int(os.environ.get("POST_MIN_SCORE", "60"))  # serve mode: only ping a game if its top pick >= this
+RESCAN_ON_BOOT        = os.environ.get("RESCAN_ON_BOOT", "").strip().lower() in ("1", "true", "yes", "on")
 POSTED_STATE_PATH     = os.environ.get("POSTED_STATE_PATH", _p("pregame_posted.json"))
 RESULTS_HOUR_ET       = int(os.environ.get("RESULTS_HOUR_ET", "3"))   # serve mode: grade the prior day at ~this hour
 PREDICTIONS_PATH      = os.environ.get("PREDICTIONS_PATH", _p("pregame_predictions.json"))
@@ -1137,6 +1138,12 @@ def run_scheduler():
     else:
         print("[serve][warn] DATA_DIR unset — state saves to the working dir and WIPES on redeploy. "
               "Set DATA_DIR to your volume mount (e.g. /data).")
+    if RESCAN_ON_BOOT:
+        today0 = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+        d = _load(POSTED_STATE_PATH); d.pop(today0, None); _save(POSTED_STATE_PATH, d)
+        print(f"[serve] RESCAN_ON_BOOT set — cleared posted-state for {today0}; every game/side "
+              f"will be re-scanned and re-posted on the first poll. REMOVE this env var afterward "
+              f"so normal restarts don't re-post the whole board.")
     while True:
         try:
             today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
