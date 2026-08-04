@@ -487,7 +487,7 @@ def _scan_recent_subs(date_str, window_days):
                 side_team[side] = t.get("id")
                 side_abbr[side] = t.get("abbreviation") or t.get("triCode") or str(t.get("id"))
                 if t.get("id") is not None:
-                    teams.setdefault(t["id"], {"subs": 0, "games": set()})["games"].add(pk)
+                    teams.setdefault(t["id"], {"subs": 0, "platoon": 0, "games": set()})["games"].add(pk)
                 for ppid in box.get(side, {}).get("pitchers", []):     # who pitched + pitch load
                     if not gdate:
                         continue
@@ -506,6 +506,13 @@ def _scan_recent_subs(date_str, window_days):
                     is_sub = ev.get("isSubstitution", False) or det.get("event") == "Offensive Substitution"
                     if is_sub and "pinch-hitter" in desc.lower() and bt is not None:
                         teams[bt]["subs"] += 1
+                        # PLATOON move? compare handedness of the incoming PH vs the man out.
+                        in_id  = ev.get("player", {}).get("id")
+                        out_id = ev.get("replacedPlayer", {}).get("id")
+                        if in_id and out_id:
+                            ih, oh = batter_hand(in_id), batter_hand(out_id)
+                            if ih in ("L", "R", "S") and oh in ("L", "R", "S") and ih != oh:
+                                teams[bt]["platoon"] = teams[bt].get("platoon", 0) + 1
                         m = re.search(r"replaces\s+(.+?)[.\n]", desc, re.IGNORECASE)
                         if m:
                             full = m.group(1).strip()
@@ -516,7 +523,8 @@ def _scan_recent_subs(date_str, window_days):
         except Exception as e:
             print(f"[scan] game {pk} error: {e}")
 
-    result = {"teams": {str(tid): {"subs": t["subs"], "games": len(t["games"])}
+    result = {"teams": {str(tid): {"subs": t["subs"], "platoon": t.get("platoon", 0),
+                                   "games": len(t["games"])}
                         for tid, t in teams.items()},
               "players": players,
               "pitchers": pitchers}    # {pid: {date: pitch_count}} for load-based availability
@@ -558,23 +566,31 @@ def unavailable_relievers(date_str):
     return out
 
 def manager_tendency(date_str):
-    """{team_id: {subs,games,rate,tier}} over MANAGER_LOOKBACK_DAYS. Tiers are relative
-    to the league distribution. Derived from the shared scan."""
+    """{team_id: {subs,platoon,games,rate,tier,platoon_rate,platoon_tier}} over
+    MANAGER_LOOKBACK_DAYS. Tiers are relative to the league distribution. `platoon_*` is
+    the PLATOON-specific pinch-hit rate (opposite-handed swaps only) — the tier the model
+    uses, since every pick here is a platoon spot. Derived from the shared scan."""
     teams = _scan_recent_subs(date_str, MANAGER_LOOKBACK_DAYS).get("teams", {})
     if not teams:
         return {}
-    result, rates = {}, []
+    result, rates, prates = {}, [], []
     for tid, t in teams.items():
         g = max(1, t["games"])
         rate = t["subs"] / g
-        result[tid] = {"subs": t["subs"], "games": g, "rate": round(rate, 2)}
-        rates.append(rate)
-    rates.sort()
-    def pct(p):
-        return rates[min(len(rates) - 1, int(p * len(rates)))] if rates else 0
-    hi, lo = pct(0.66), pct(0.33)
+        prate = t.get("platoon", 0) / g
+        result[tid] = {"subs": t["subs"], "platoon": t.get("platoon", 0), "games": g,
+                       "rate": round(rate, 2), "platoon_rate": round(prate, 2)}
+        rates.append(rate); prates.append(prate)
+    def tier_of(val, dist):
+        d = sorted(dist)
+        if not d:
+            return "med"
+        hi = d[min(len(d) - 1, int(0.66 * len(d)))]
+        lo = d[min(len(d) - 1, int(0.33 * len(d)))]
+        return "high" if val >= hi else ("low" if val <= lo else "med")
     for tid, r in result.items():
-        r["tier"] = "high" if r["rate"] >= hi else ("low" if r["rate"] <= lo else "med")
+        r["tier"] = tier_of(r["rate"], rates)                 # overall (kept for context)
+        r["platoon_tier"] = tier_of(r["platoon_rate"], prates)  # what the model scores on
     return result
 
 _TEAM_ABBR = {}
@@ -799,7 +815,7 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
 
     add = {"high": 20, "med": 10, "low": 3}.get(mgr_tier, 10)
     score += add
-    reasons.append(f"Manager pinch-hit tendency: {mgr_tier.upper()}")
+    reasons.append(f"Manager platoon pinch-hit tendency: {mgr_tier.upper()}")
 
     if order and order >= 7:
         score += 10
@@ -884,6 +900,20 @@ def confirmed_lineup(game_pk):
         out[side]["starters"] = [entry(pid) for pid in box.get(side, {}).get("battingOrder", [])]
         out[side]["bench"]    = [entry(pid) for pid in box.get(side, {}).get("bench", [])]
     return out
+
+def batter_hand(pid):
+    """Cached bat side (L/R/S) — used to tag whether a pinch-hit was a platoon move."""
+    key = "bh_" + str(pid)
+    if key in _player_cache:
+        return _player_cache[key]
+    hand = None
+    try:
+        person = _get(f"{API}/people/{pid}").get("people", [{}])[0]
+        hand = person.get("batSide", {}).get("code")
+    except Exception:
+        pass
+    _player_cache[key] = hand
+    return hand
 
 def pitcher_hand(pid):
     """Cached L/R for a pitcher (used for the probable SP and each reliever)."""
@@ -987,8 +1017,8 @@ def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=Non
     if sp_hand not in ("L", "R"):
         return []  # can't score platoon without SP handedness
 
-    tier = mgr.get(str(team["id"]), {}).get("tier", "med")
     mgr_meta = mgr.get(str(team["id"]), {})
+    tier = mgr_meta.get("platoon_tier", "med")   # platoon-specific tendency (our picks are platoon spots)
     starter_ids = {s["id"] for s in starters}
     if bench is None:                       # fallback: season roster (no positions)
         bench = [p for p in active_hitters(team["id"]) if p["id"] not in starter_ids]
