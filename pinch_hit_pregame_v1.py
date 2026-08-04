@@ -785,8 +785,9 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
             reasons.append(f"Strong overall bat ({_fmt(xw)} xwOBA, Statcast) — managers keep him")
 
     # Player's OWN recent pinch-hit-for history — has THIS guy been getting pulled?
+    # 2× in the window is already a solid flag (not a half-strength one).
     if player_ph_count >= 2:
-        score += min(10.0, player_ph_count * 3.0)
+        score += 8.0 if player_ph_count == 2 else 10.0
         reasons.append(f"Pinch-hit for {player_ph_count}× in last {PINCH_HIST_DAYS}d — "
                        f"repeatedly pulled lately")
     elif player_ph_count == 1:
