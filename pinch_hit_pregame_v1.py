@@ -448,9 +448,14 @@ def _scan_recent_subs(date_str, window_days):
                 side_abbr[side] = t.get("abbreviation") or t.get("triCode") or str(t.get("id"))
                 if t.get("id") is not None:
                     teams.setdefault(t["id"], {"subs": 0, "games": set()})["games"].add(pk)
-                for ppid in box.get(side, {}).get("pitchers", []):     # who pitched, for rest
-                    if gdate:
-                        pitchers.setdefault(str(ppid), []).append(gdate)
+                for ppid in box.get(side, {}).get("pitchers", []):     # who pitched + pitch load
+                    if not gdate:
+                        continue
+                    pd = box.get(side, {}).get("players", {}).get(f"ID{ppid}", {})
+                    pc = pd.get("stats", {}).get("pitching", {})
+                    n = int(pc.get("numberOfPitches") or pc.get("pitchesThrown") or 0)
+                    day = pitchers.setdefault(str(ppid), {})
+                    day[gdate] = day.get(gdate, 0) + n
             for play in live.get("liveData", {}).get("plays", {}).get("allPlays", []):
                 half = play.get("about", {}).get("halfInning")
                 bside = "away" if half == "top" else "home"
@@ -474,7 +479,7 @@ def _scan_recent_subs(date_str, window_days):
     result = {"teams": {str(tid): {"subs": t["subs"], "games": len(t["games"])}
                         for tid, t in teams.items()},
               "players": players,
-              "pitchers": {p: sorted(set(ds)) for p, ds in pitchers.items()}}
+              "pitchers": pitchers}    # {pid: {date: pitch_count}} for load-based availability
     cutoff = (datetime.now(ET_TZ).date() - timedelta(days=3)).strftime("%Y-%m-%d")
     cache = {k: v for k, v in cache.items() if k.split(":")[0] >= cutoff}
     cache[ck] = result
@@ -482,26 +487,33 @@ def _scan_recent_subs(date_str, window_days):
     return result
 
 def unavailable_relievers(date_str):
-    """Pitchers who threw 3+ CONSECUTIVE days ending at the most recent game day —
-    genuinely fatigued / likely down today. A normal back-to-back (2 straight) is fine
-    and stays in the pen. Returns a set of pitcher ids (#2)."""
+    """Relievers likely DOWN today, from recent pitch LOAD (MLB boxscores) — the same
+    idea as a bullpen-usage grid. A pitcher is flagged when he: threw 3+ straight days,
+    OR threw a heavy single outing yesterday (>=30 pitches), OR piled up a heavy last-3
+    load (>=45). A normal light back-to-back stays available. Returns set of pitcher ids."""
     pit = _scan_recent_subs(date_str, PINCH_HIST_DAYS).get("pitchers", {})
+    # normalize: tolerate the old list-of-dates format
+    norm = {}
+    for pid, usage in pit.items():
+        norm[pid] = usage if isinstance(usage, dict) else {d: 0 for d in usage}
     alldates = set()
-    for ds in pit.values():
-        alldates.update(ds)
+    for u in norm.values():
+        alldates.update(u)
     if not alldates:
         return set()
     latest = max(alldates)
+    base = datetime.strptime(latest, "%Y-%m-%d").date()
+    last3days = {(base - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(3)}
     out = set()
-    for pid, ds in pit.items():
-        dss = set(ds)
-        if latest not in dss:                 # rested most recent day → available
+    for pid, u in norm.items():
+        if latest not in u:                    # didn't pitch the most recent day → rested
             continue
         streak = 1
-        base = datetime.strptime(latest, "%Y-%m-%d").date()
-        while (base - timedelta(days=streak)).strftime("%Y-%m-%d") in dss:
+        while (base - timedelta(days=streak)).strftime("%Y-%m-%d") in u:
             streak += 1
-        if streak >= 3:                        # 3+ straight days → likely unavailable
+        yday_pitches = u.get(latest, 0) or 0
+        last3 = sum(v or 0 for d, v in u.items() if d in last3days)
+        if streak >= 3 or yday_pitches >= 30 or last3 >= 45:
             out.add(int(pid))
     return out
 
@@ -673,7 +685,7 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
         reasons.append(f"Career vs {sp_name}: limited history ({bvp['ab']} AB)")
 
     if pen_mix and pen_mix.get("rested_out") and scenario in ("disadvantage", "flip"):
-        reasons.append(f"({pen_mix['rested_out']} opp reliever(s) likely down — pitched 3+ straight days)")
+        reasons.append(f"({pen_mix['rested_out']} opp reliever(s) likely down — heavy recent pitch load)")
 
     # Starter length (#1): short-leash/opener → bullpen enters early → pull happens
     # sooner; workhorse → starter stays in → flip is less likely.
