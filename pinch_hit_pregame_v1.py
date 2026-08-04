@@ -89,6 +89,7 @@ MANAGER_CACHE_PATH = os.environ.get("MANAGER_CACHE_PATH", _p("pregame_manager_te
 SUBS_CACHE_PATH    = os.environ.get("SUBS_CACHE_PATH",    _p("pregame_subs_scan.json"))
 STATCAST_CACHE_PATH = os.environ.get("STATCAST_CACHE_PATH", _p("pregame_statcast.json"))
 PITCH_CACHE_PATH    = os.environ.get("PITCH_CACHE_PATH",    _p("pregame_pitchdata.json"))
+PITCHER_XW_CACHE_PATH = os.environ.get("PITCHER_XW_CACHE_PATH", _p("pregame_pitcher_xwoba.json"))
 
 _session = requests.Session()
 
@@ -161,6 +162,45 @@ def _load_statcast():
 
 def statcast_xwoba(pid):
     return _load_statcast().get(int(pid), {})
+
+# ── Pitcher quality — xwOBA-ALLOWED (Savant) → starter & bullpen "grade" ──────────
+# Powers the batter-vs-pitcher mismatch (starter's grade vs the batter's xwOBA) and
+# league bullpen quality (averaged over the available pen). Lower = tougher pitcher.
+_pitcher_xw = None
+def _load_pitcher_xwoba():
+    global _pitcher_xw
+    if _pitcher_xw is not None:
+        return _pitcher_xw
+    today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+    disk = _load(PITCHER_XW_CACHE_PATH)
+    if disk.get("date") == today and disk.get("data"):
+        _pitcher_xw = {int(k): v for k, v in disk["data"].items()}
+        return _pitcher_xw
+    data = {}
+    try:
+        r = _session.get("https://baseballsavant.mlb.com/leaderboard/expected_statistics",
+                         params={"type": "pitcher", "year": SEASON, "min": "1", "csv": "true"},
+                         headers={"User-Agent": "Mozilla/5.0 (pinch-hit-model)"}, timeout=30)
+        r.raise_for_status()
+        for row in csv.DictReader(io.StringIO(r.content.decode("utf-8-sig"))):
+            try:
+                pid = int(row.get("player_id"))
+                xw = _to_float(row.get("est_woba"))
+                if pid and xw is not None:
+                    data[pid] = xw
+            except Exception:
+                continue
+        print(f"[pitcher-xw] loaded xwOBA-allowed for {len(data)} pitchers")
+    except Exception as e:
+        print(f"[pitcher-xw] load error: {e}")
+    _pitcher_xw = data
+    _save(PITCHER_XW_CACHE_PATH, {"date": today, "data": {str(k): v for k, v in data.items()}})
+    return _pitcher_xw
+
+def pitcher_xwoba(pid):
+    if not pid:
+        return None
+    return _load_pitcher_xwoba().get(int(pid))
 
 # ── Starter length (#1) — avg innings per start = how early the bullpen enters ────
 def _parse_ip(s):
@@ -585,7 +625,7 @@ def classify_matchup(prof, sp_hand):
     return "none"
 
 def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
-                  pen_mix=None, bvp=None, player_ph_count=0, sp_len=None, arsenal=None):
+                  pen_mix=None, bvp=None, player_ph_count=0, sp_len=None, arsenal=None, sp_xw=None):
     """Return (score 0-100, reasons[list]). Higher = more likely lifted = better under."""
     reasons = []
     score = 0.0
@@ -710,6 +750,26 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
             reasons.append(f"Tough vs {sp_name}'s arsenal ({wrv:+.1f} RV/100; heavy {pt}) — struggles vs his mix")
         elif wrv >= 0.4:
             reasons.append(f"Handles {sp_name}'s arsenal well ({wrv:+.1f} RV/100) — favorable, less under value")
+
+    # PRODUCTION: how tough is the pitching he'll face? (batter-vs-pitcher mismatch +
+    # league bullpen quality). Strong pitching → he produces less → better under.
+    # Skipped for flip (volume thesis; he faces his good matchup only briefly).
+    if scenario == "disadvantage":
+        if sp_xw is not None:                  # starter grade (xwOBA-allowed): the mismatch
+            if sp_xw <= 0.295:
+                score += 5
+                reasons.append(f"Tough starter — {sp_name} allows just {_fmt(sp_xw)} xwOBA")
+            elif sp_xw >= 0.345:
+                score -= 5
+                reasons.append(f"Hittable starter — {sp_name} allows {_fmt(sp_xw)} xwOBA (less under value)")
+        pen_xw = pen_mix.get("pen_xwoba") if pen_mix else None
+        if pen_xw is not None:                  # league bullpen quality (available arms)
+            if pen_xw <= 0.305:
+                score += 4
+                reasons.append(f"Strong opposing pen ({_fmt(pen_xw)} xwOBA-allowed) — tough late at-bats too")
+            elif pen_xw >= 0.335:
+                score -= 4
+                reasons.append(f"Weak opposing pen ({_fmt(pen_xw)} xwOBA-allowed) — easier late at-bats")
 
     # Statcast overall quality: weak bats are more pull-prone (applies to both scenarios).
     # The strong-bat dampener is SKIPPED for flip — a good platoon hitter still gets
@@ -849,12 +909,13 @@ def opposing_bullpen_mix(team_id, exclude_sp_id, unavailable=None):
     starter, rotation-only starters who won't relieve (keeps swingmen), and back-to-back
     arms likely down today. The result reflects who can actually pitch in relief."""
     unavailable = unavailable or set()
-    mix = {"L": 0, "R": 0, "total": 0, "rested_out": 0, "rotation_out": 0}
+    mix = {"L": 0, "R": 0, "total": 0, "rested_out": 0, "rotation_out": 0, "pen_xwoba": None}
     try:
         data = _get(f"{API}/teams/{team_id}/roster", params={"rosterType": "active"})
     except Exception as e:
         print(f"[bullpen] team {team_id} error: {e}")
         return mix
+    xw_sum, xw_n = 0.0, 0
     for p in data.get("roster", []):
         if p.get("position", {}).get("type") != "Pitcher":
             continue
@@ -864,13 +925,18 @@ def opposing_bullpen_mix(team_id, exclude_sp_id, unavailable=None):
         if pitcher_role(ppid) == "SP":        # rotation starter, not pitching today → not the pen
             mix["rotation_out"] += 1
             continue
-        if ppid in unavailable:               # threw back-to-back — likely unavailable today
+        if ppid in unavailable:               # heavy recent load — likely unavailable today
             mix["rested_out"] += 1
             continue
         h = pitcher_hand(ppid)
         if h in ("L", "R"):
             mix[h] += 1
             mix["total"] += 1
+            xw = pitcher_xwoba(ppid)           # bullpen QUALITY: avg xwOBA-allowed of available arms
+            if xw is not None:
+                xw_sum += xw; xw_n += 1
+    if xw_n:
+        mix["pen_xwoba"] = round(xw_sum / xw_n, 3)
     return mix
 
 def active_hitters(team_id):
@@ -908,6 +974,7 @@ def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=Non
     bench = [p for p in active_hitters(team["id"]) if p["id"] not in starter_ids]
     pen_mix = opposing_bullpen_mix(opp_team["id"], sp_id, unavailable)
     sp_len  = starter_length(sp_id)
+    sp_xw   = pitcher_xwoba(sp_id)          # starter quality (xwOBA-allowed) for the mismatch
 
     candidates = []
     for order, s in enumerate(starters, start=1):
@@ -925,7 +992,7 @@ def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=Non
         ph_count = ph_hist.get(f"{team['id']}|{_lastname(prof.get('name') or s.get('fullName'))}", 0)
         arsenal = arsenal_matchup(s["id"], sp_id) if sp_id else None
         score, reasons = score_starter(prof, sp_hand, sp_name, order, tier, bench_note,
-                                       scenario, pen_mix, bvp, ph_count, sp_len, arsenal)
+                                       scenario, pen_mix, bvp, ph_count, sp_len, arsenal, sp_xw)
         if score >= MIN_SCORE:
             candidates.append({
                 "score": score, "name": prof.get("name") or s.get("fullName"),
