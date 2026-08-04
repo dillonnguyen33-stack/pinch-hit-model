@@ -625,7 +625,8 @@ def classify_matchup(prof, sp_hand):
     return "none"
 
 def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
-                  pen_mix=None, bvp=None, player_ph_count=0, sp_len=None, arsenal=None, sp_xw=None):
+                  pen_mix=None, bvp=None, player_ph_count=0, sp_len=None, arsenal=None,
+                  sp_xw=None, starter_pos=None):
     """Return (score 0-100, reasons[list]). Higher = more likely lifted = better under."""
     reasons = []
     score = 0.0
@@ -814,25 +815,38 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_note, scenario,
         score *= 1.10
         reasons.append(f"Part-time/platoon profile (~{total_pa} PA) — higher pull risk")
 
+    # Positional realism: a starting CATCHER is rarely pinch-hit for before the 9th — it
+    # burns the only backup and leaves the team a catcher short. Strong dampener.
+    if starter_pos == "C":
+        score *= 0.55
+        reasons.append("Catcher — rarely pinch-hit for before the 9th (burns the backup); low early-pull risk")
+
     return max(0, min(100, round(score))), reasons
 
-def find_bench_upgrade(ref_ops, plan_hand, bench_players):
-    """Is there a bench bat OPPOSITE-handed to `plan_hand` (so it holds the platoon
-    edge vs a `plan_hand` pitcher) whose OPS vs `plan_hand` clearly beats ref_ops?
-    Used by both scenarios: Scenario 2 plans around the same-handed starter; Scenario 1
-    plans around the opposing pen's incoming flip-hand reliever."""
+def find_bench_upgrade(ref_ops, plan_hand, bench_players, starter_pos=None):
+    """A bench bat OPPOSITE-handed to `plan_hand` whose OPS vs `plan_hand` clearly beats
+    ref_ops — AND is a positionally realistic replacement: a starting catcher can only be
+    swapped for another catcher, and a bench catcher isn't burned to pinch-hit for a field
+    player early. Returns a description or None."""
     faced = "vl" if plan_hand == "L" else "vr"
     ref = ref_ops or 0.0
     best = None
     for bp in bench_players:
-        bprof = get_hitter_profile(bp["id"], bp["name"])
+        bpos = bp.get("pos")
+        if starter_pos == "C":
+            if bpos != "C":               # only a catcher realistically replaces a catcher
+                continue
+        elif bpos == "C":                 # don't burn the backup catcher to PH for a field player
+            continue
+        name = bp.get("fullName") or bp.get("name")
+        bprof = get_hitter_profile(bp["id"], name)
         b_bats = bprof.get("bats")
-        if b_bats == plan_hand:            # want the opposite-handed platoon edge
+        if b_bats == plan_hand:           # want the opposite-handed platoon edge
             continue
         b_fo = bprof.get(faced, {}).get("ops")
         if b_fo is not None and b_fo >= ref + 0.060:
             if best is None or b_fo > best[1]:
-                best = (bprof.get("name") or bp["name"], b_fo, b_bats)
+                best = (bprof.get("name") or name, b_fo, b_bats)
     if best:
         return f"{best[0]} ({best[2]}, {_fmt(best[1])} OPS vs {plan_hand}HP)"
     return None
@@ -849,21 +863,25 @@ def get_slate(date_str, limit=None):
     return games
 
 def confirmed_lineup(game_pk):
-    """The OFFICIAL lineup from the boxscore batting-order card — authoritative,
-    unlike the schedule's `lineups` hydrate which can carry a PREDICTED lineup
-    that later changes (this is what wrongly included a non-starter). Returns
-    {"away":[{id,fullName}], "home":[...]} in batting order; empty until posted."""
-    out = {"away": [], "home": []}
+    """The OFFICIAL lineup from the boxscore batting-order card — authoritative, unlike
+    the schedule's predicted feed. Also returns the GAME-DAY bench (the real available
+    subs for THIS game — reflects trades/call-ups, unlike the season roster). Each player
+    carries their position. Returns {"away":{"starters":[{id,fullName,pos}],"bench":[...]},
+    "home":{...}}; starters empty until posted."""
+    out = {"away": {"starters": [], "bench": []}, "home": {"starters": [], "bench": []}}
     try:
-        data = _get(f"{API}/game/{game_pk}/boxscore", timeout=20)   # lighter than feed/live
+        data = _get(f"{API}/game/{game_pk}/boxscore", timeout=20)
     except Exception:
         return out
     box = data.get("teams", {})
     for side in ("away", "home"):
         players = box.get(side, {}).get("players", {})
-        for pid in box.get(side, {}).get("battingOrder", []):
+        def entry(pid):
             pd = players.get(f"ID{pid}", {})
-            out[side].append({"id": pid, "fullName": pd.get("person", {}).get("fullName", "")})
+            return {"id": pid, "fullName": pd.get("person", {}).get("fullName", ""),
+                    "pos": pd.get("position", {}).get("abbreviation")}
+        out[side]["starters"] = [entry(pid) for pid in box.get(side, {}).get("battingOrder", [])]
+        out[side]["bench"]    = [entry(pid) for pid in box.get(side, {}).get("bench", [])]
     return out
 
 def pitcher_hand(pid):
@@ -952,10 +970,10 @@ def active_hitters(team_id):
         print(f"[roster] team {team_id} error: {e}")
     return out
 
-def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=None):
+def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=None, bench=None):
     """Score one team's hitters vs the opposing probable pitcher. Only needs THAT
     team's lineup (+ the opposing SP, known in advance) — so we can fire the instant
-    a team's lineup drops, without waiting for the opponent's."""
+    a team's lineup drops. `bench` is the GAME-DAY bench (with positions)."""
     ph_hist = ph_hist or {}
     if len(starters) < 9:
         return []
@@ -971,7 +989,8 @@ def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=Non
     tier = mgr.get(str(team["id"]), {}).get("tier", "med")
     mgr_meta = mgr.get(str(team["id"]), {})
     starter_ids = {s["id"] for s in starters}
-    bench = [p for p in active_hitters(team["id"]) if p["id"] not in starter_ids]
+    if bench is None:                       # fallback: season roster (no positions)
+        bench = [p for p in active_hitters(team["id"]) if p["id"] not in starter_ids]
     pen_mix = opposing_bullpen_mix(opp_team["id"], sp_id, unavailable)
     sp_len  = starter_length(sp_id)
     sp_xw   = pitcher_xwoba(sp_id)          # starter quality (xwOBA-allowed) for the mismatch
@@ -981,18 +1000,19 @@ def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=Non
         prof = get_hitter_profile(s["id"], s.get("fullName"))
         scenario = classify_matchup(prof, sp_hand)
         bats  = prof.get("bats")
+        pos   = s.get("pos")
         faced = "vl" if sp_hand == "L" else "vr"
         opp   = "vr" if sp_hand == "L" else "vl"
         bench_note = None
         if scenario == "disadvantage":
-            bench_note = find_bench_upgrade(prof.get(faced, {}).get("ops"), sp_hand, bench)
+            bench_note = find_bench_upgrade(prof.get(faced, {}).get("ops"), sp_hand, bench, pos)
         elif scenario == "flip":
-            bench_note = find_bench_upgrade(prof.get(opp, {}).get("ops"), bats, bench)
+            bench_note = find_bench_upgrade(prof.get(opp, {}).get("ops"), bats, bench, pos)
         bvp = get_bvp(s["id"], sp_id) if sp_id else None
         ph_count = ph_hist.get(f"{team['id']}|{_lastname(prof.get('name') or s.get('fullName'))}", 0)
         arsenal = arsenal_matchup(s["id"], sp_id) if sp_id else None
         score, reasons = score_starter(prof, sp_hand, sp_name, order, tier, bench_note,
-                                       scenario, pen_mix, bvp, ph_count, sp_len, arsenal, sp_xw)
+                                       scenario, pen_mix, bvp, ph_count, sp_len, arsenal, sp_xw, pos)
         if score >= MIN_SCORE:
             candidates.append({
                 "score": score, "name": prof.get("name") or s.get("fullName"),
@@ -1014,7 +1034,9 @@ def analyze_game(g, mgr, lineup=None, ph_hist=None, unavailable=None):
         lineup = confirmed_lineup(g.get("gamePk"))
     cands = []
     for side, opp_side in (("away", "home"), ("home", "away")):
-        cands += analyze_side(g, side, opp_side, lineup.get(side, []), mgr, ph_hist, unavailable)
+        sd = lineup.get(side, {})
+        cands += analyze_side(g, side, opp_side, sd.get("starters", []), mgr,
+                              ph_hist, unavailable, sd.get("bench"))
     cands.sort(key=lambda c: c["score"], reverse=True)
     return cands
 
@@ -1258,19 +1280,23 @@ def run_scheduler():
                 # it's the same lineup we already handled.
                 lineup = confirmed_lineup(pk)
                 for side, opp_side in (("away", "home"), ("home", "away")):
-                    starters = lineup.get(side, [])
+                    sd = lineup.get(side, {})
+                    starters = sd.get("starters", [])
                     if len(starters) < 9:                 # this team's card not posted yet
                         continue
                     skey = f"{pk}:{side}"
-                    fp = ",".join(str(s["id"]) for s in starters)
+                    # fingerprint includes the bench, so a trade/roster move (bench change)
+                    # also re-triggers an updated board, not just a lineup change.
+                    fp = (",".join(str(s["id"]) for s in starters) + "|" +
+                          ",".join(str(b["id"]) for b in sd.get("bench", [])))
                     prev = posted.get(skey)
-                    if prev and prev.get("fp") == fp:     # same lineup already handled → skip
+                    if prev and prev.get("fp") == fp:     # same lineup+bench already handled → skip
                         continue
                     if state in ("Live", "Final"):        # game started — too late
                         _mark_handled(today, skey, fp, False); posted[skey] = {"fp": fp, "posted": False}
                         continue
-                    is_update = bool(prev and prev.get("posted"))   # we already posted a different lineup
-                    cands = analyze_side(g, side, opp_side, starters, mgr, ph_hist, unavail)
+                    is_update = bool(prev and prev.get("posted"))   # already posted a different state
+                    cands = analyze_side(g, side, opp_side, starters, mgr, ph_hist, unavail, sd.get("bench"))
                     _save(PLAYER_CACHE_PATH, _player_cache)
                     tm = g["teams"][side]["team"].get("abbreviation")
                     top = cands[0]["score"] if cands else 0
