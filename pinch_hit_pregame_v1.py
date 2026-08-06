@@ -443,13 +443,24 @@ def _to_float(x):
         return None
 
 # ── recent pinch-hit scan (one pass powers BOTH team tendency AND player history) ─
+def _ph_pos(players_box, pid):
+    """A player's FIELDING position from a boxscore players dict (the last real position he
+    played); falls back to 'PH' when he only pinch-hit and never took the field (a last-chance
+    at-bat). `players_box` is boxscore.teams[side].players."""
+    pl = players_box.get(f"ID{pid}", {})
+    fld = [p.get("abbreviation") for p in pl.get("allPositions", [])
+           if p.get("abbreviation") not in (None, "PH", "PR")]
+    if fld:
+        return fld[-1]
+    return pl.get("position", {}).get("abbreviation") or "?"
+
 def _scan_recent_subs(date_str, window_days):
     """Single pass over final games in the last `window_days` (ending the day before
     date_str). Returns {"teams": {tid: {subs,games}}, "players": {"tid|last": {...}}}.
     Cached per (date, window) so the day's first run pays the cost once. This is the
     shared scanner behind manager_tendency() and pinch_hit_history()."""
     if window_days <= 0:
-        return {"teams": {}, "players": {}, "pitchers": {}, "pen_usage": {}}
+        return {"teams": {}, "players": {}, "pitchers": {}, "pen_usage": {}, "ph_events": {}, "team_dates": {}}
     cache = _load(SUBS_CACHE_PATH)
     ck = f"{date_str}:{window_days}"
     if ck in cache:
@@ -471,12 +482,14 @@ def _scan_recent_subs(date_str, window_days):
                     pk_date[g["gamePk"]] = g.get("officialDate") or d.get("date")
     except Exception as e:
         print(f"[scan] schedule error: {e}")
-        return {"teams": {}, "players": {}, "pitchers": {}, "pen_usage": {}}
+        return {"teams": {}, "players": {}, "pitchers": {}, "pen_usage": {}, "ph_events": {}, "team_dates": {}}
 
     teams = {}     # tid -> {"subs":int, "games":set}
     players = {}   # "tid|last" -> {"name","team","team_id","count"}
     pitchers = {}  # pid_str -> {date: pitch_count}  (#2 reliever-rest)
     pen_usage = {} # pid_str -> {"team":tid, "apps":{date:{pitches,inning,was_last}}}  (bullpen projection)
+    ph_events  = {} # tid_str -> [{date,out_pos,in_pos,out_hand,in_hand,out_name,in_name}]  (recent PH profile)
+    team_dates = {} # tid_str -> set of game-dates (to slice a coach's last N games)
     for pk in game_pks:
         try:
             live = _get(f"{API11}/game/{pk}/feed/live", timeout=20)
@@ -490,6 +503,8 @@ def _scan_recent_subs(date_str, window_days):
                 side_abbr[side] = t.get("abbreviation") or t.get("triCode") or str(t.get("id"))
                 if t.get("id") is not None:
                     teams.setdefault(t["id"], {"subs": 0, "platoon": 0, "games": set()})["games"].add(pk)
+                    if gdate:
+                        team_dates.setdefault(str(t["id"]), set()).add(gdate)
                 plist = box.get(side, {}).get("pitchers", [])           # in appearance order
                 for ppid in plist:                                      # who pitched + pitch load
                     if not gdate:
@@ -522,15 +537,23 @@ def _scan_recent_subs(date_str, window_days):
                         # PLATOON move? compare handedness of the incoming PH vs the man out.
                         in_id  = ev.get("player", {}).get("id")
                         out_id = ev.get("replacedPlayer", {}).get("id")
-                        if in_id and out_id:
-                            ih, oh = batter_hand(in_id), batter_hand(out_id)
-                            if ih in ("L", "R", "S") and oh in ("L", "R", "S") and ih != oh:
-                                teams[bt]["platoon"] = teams[bt].get("platoon", 0) + 1
-                        m = re.search(r"replaces\s+(.+?)[.\n]", desc, re.IGNORECASE)
-                        if m:
-                            full = m.group(1).strip()
-                            key = f"{bt}|{_lastname(full)}"
-                            e = players.setdefault(key, {"name": full, "team": side_abbr.get(bside),
+                        ih = batter_hand(in_id) if in_id else None
+                        oh = batter_hand(out_id) if out_id else None
+                        if ih in ("L", "R", "S") and oh in ("L", "R", "S") and ih != oh:
+                            teams[bt]["platoon"] = teams[bt].get("platoon", 0) + 1
+                        pbox = box.get(bside, {}).get("players", {})
+                        out_pos = _ph_pos(pbox, out_id) if out_id else "?"   # position pulled
+                        in_pos  = _ph_pos(pbox, in_id) if in_id else "?"     # what the sub plays
+                        mo = re.search(r"pinch-hitter\s+(.+?)\s+replaces\s+(.+?)[.\n]", desc, re.IGNORECASE)
+                        in_name  = mo.group(1).strip() if mo else None
+                        out_name = mo.group(2).strip() if mo else None
+                        if gdate:                            # per-event PH profile (recent-N + swaps)
+                            ph_events.setdefault(str(bt), []).append(
+                                {"date": gdate, "out_pos": out_pos, "in_pos": in_pos,
+                                 "out_hand": oh, "in_hand": ih, "out_name": out_name, "in_name": in_name})
+                        if out_name:
+                            key = f"{bt}|{_lastname(out_name)}"
+                            e = players.setdefault(key, {"name": out_name, "team": side_abbr.get(bside),
                                                          "team_id": bt, "count": 0})
                             e["count"] += 1
             if gdate:                                   # stamp entry innings onto this game's apps
@@ -546,7 +569,9 @@ def _scan_recent_subs(date_str, window_days):
                         for tid, t in teams.items()},
               "players": players,
               "pitchers": pitchers,    # {pid: {date: pitch_count}} for load-based availability
-              "pen_usage": pen_usage}  # {pid: {team, apps:{date:{pitches,inning,was_last}}}} for projection
+              "pen_usage": pen_usage,  # {pid: {team, apps:{date:{pitches,inning,was_last}}}} for projection
+              "ph_events": ph_events,  # {tid: [PH events w/ positions+hands]} for recent-N coach profile
+              "team_dates": {tid: sorted(ds) for tid, ds in team_dates.items()}}
     cutoff = (datetime.now(ET_TZ).date() - timedelta(days=3)).strftime("%Y-%m-%d")
     cache = {k: v for k, v in cache.items() if k.split(":")[0] >= cutoff}
     cache[ck] = result
@@ -611,6 +636,24 @@ def manager_tendency(date_str):
         r["tier"] = tier_of(r["rate"], rates)                 # overall (kept for context)
         r["platoon_tier"] = tier_of(r["platoon_rate"], prates)  # what the model scores on
     return result
+
+def manager_recent_ph(date_str, team_id, games=5):
+    """A coach's RECENT pinch-hit profile over his last `games` games — far more current than
+    the 14-day team rate at the deadline/call-up churn, when a specific player's pull tendency
+    swings. Returns {games, n_ph, n_platoon, swaps, events}: `n_ph`/`n_platoon` = pinch-hit
+    (and opposite-handed platoon) count in the window; `swaps` = the position moves he made,
+    e.g. ['LF→CF', 'C→DH'] (out position → what the sub plays); `events` = the raw list."""
+    scan = _scan_recent_subs(date_str, MANAGER_LOOKBACK_DAYS)
+    tid = str(team_id)
+    dates = scan.get("team_dates", {}).get(tid, [])
+    window = set(sorted(dates, reverse=True)[:games])          # this team's most recent N game-dates
+    evs = [e for e in scan.get("ph_events", {}).get(tid, []) if e.get("date") in window]
+    n_platoon = sum(1 for e in evs
+                    if e.get("out_hand") in ("L", "R", "S") and e.get("in_hand") in ("L", "R", "S")
+                    and e["out_hand"] != e["in_hand"])
+    swaps = [f"{e.get('out_pos','?')}→{e.get('in_pos','?')}" for e in evs]
+    return {"games": len(window), "n_ph": len(evs), "n_platoon": n_platoon,
+            "swaps": swaps, "events": evs}
 
 _TEAM_ABBR = {}
 def _team_abbr(tid):
@@ -677,6 +720,7 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_res, scenario,
     blended = prof.get(faced, {}).get("blended", False)
     total_pa = fpa + opa
     flip_share = None       # set in the flip pen block; gates the end-of-function dampener
+    dis_share  = None       # disadvantage: usage-wtd share of pen that KEEPS him weak (sp_hand)
 
     if scenario == "disadvantage":
         # SCENARIO 2: same-handed weak-side start. Poor matchup; pulled if early ABs
@@ -694,17 +738,28 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_res, scenario,
             samp = f", small sample {fpa_eff} PA vs {sp_hand}HP"
         reasons.append(f"Poor matchup — bats {bats} into {sp_hand}HP: {_fmt(fo)} OPS vs "
                        f"{sp_hand}HP (vs {_fmt(oo)} opposite){samp}")
-        if pen_mix and pen_mix.get("total", 0) >= 4:
-            same = pen_mix.get(sp_hand, 0); tot = pen_mix["total"]; share = same / tot
-            if share >= 0.60:
-                score += min(12.0, (share - 0.50) / 0.40 * 12.0)
-                reasons.append(f"Opposing pen {same}/{tot} {sp_hand}HP ({share:.0%}) — "
-                               f"weak matchup persists after the starter")
-            elif share <= 0.40:
-                reasons.append(f"Opposing pen only {same}/{tot} {sp_hand}HP ({share:.0%}) — "
-                               f"a favorable reliever is likely later (lower certainty)")
-            else:
-                reasons.append(f"Opposing pen {same}/{tot} {sp_hand}HP ({share:.0%})")
+        # Does the weak matchup PERSIST after the starter? Prefer the projected bullpen: the
+        # usage-weighted share of the arms likely to pitch that throw his WEAK hand (== sp_hand).
+        # High share → he keeps facing his weak side → pull-risk holds/boosts. LOW share → a
+        # FAVORABLE reliever is likely → the starter leaves and he gets bailed out (rarely pulled,
+        # better late ABs) → the end-of-function dampener cuts the score. Fall back to flat count.
+        wshare, wseq, nweak, ntot = pen_weak_share(pen_pred, sp_hand)
+        if wshare is not None:
+            dis_share = wshare
+            src = f"Proj bullpen {nweak}/{ntot} {sp_hand}HP, usage-wtd {wshare:.0%} ({wseq})"
+        elif pen_mix and pen_mix.get("total", 0) >= 4:
+            same = pen_mix.get(sp_hand, 0); tot = pen_mix["total"]; dis_share = same / tot
+            src = f"Opposing pen {same}/{tot} {sp_hand}HP ({dis_share:.0%})"
+        else:
+            src = None
+        if src is not None:
+            if dis_share >= 0.60:
+                score += min(12.0, (dis_share - 0.50) / 0.40 * 12.0)
+                reasons.append(f"{src} — weak matchup persists after the starter")
+            elif dis_share >= 0.45:
+                reasons.append(f"{src} — some relief possible later")
+            # dis_share < 0.45 → favorable reliever likely; the end-of-function dampener cuts the
+            # whole score (and prints the reason) rather than a cosmetic note here.
 
     elif scenario == "flip":
         # SCENARIO 1: opposite-handed platoon start FOR the matchup. Likely pinch-hit
@@ -721,7 +776,7 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_res, scenario,
         # (== bats) — those are the arms that neutralize his edge and cue the pinch-hit. Fall
         # back to the flat available-pen L/R count only when we can't project (early season,
         # no recent usage). A gassed closer contributes ~0 to the weighted share automatically.
-        pshare, pseq, nweak, ntot = flip_pen_read(pen_pred, bats)
+        pshare, pseq, nweak, ntot = pen_weak_share(pen_pred, bats)
         if pshare is not None:
             flip_share = pshare
             src = f"Proj bullpen {nweak}/{ntot} {bats}HP, usage-wtd {pshare:.0%} ({pseq})"
@@ -904,6 +959,24 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_res, scenario,
             score *= 1.05
             reasons.append(f"Flip likely — {flip_share:.0%} of the projected bullpen throws "
                            f"{bats}HP; strong weak-side trigger odds (boosted)")
+
+    # Disadvantage: the PULL leg needs his weak hand (== sp_hand) to keep coming. If the pen is
+    # mostly his FAVORABLE hand, the starter leaves and a good matchup bails him out — he's
+    # rarely pinch-hit and even hits better late. Dampen the whole score. GENTLER than flip: a
+    # disadvantage pick keeps some PRODUCTION value (he still faces the weak-side STARTER early),
+    # so this scales it down, doesn't gut it.
+    if scenario == "disadvantage" and dis_share is not None:
+        if dis_share < 0.30:
+            score *= 0.60
+            reasons.append(f"Favorable pen — only {dis_share:.0%} of the projected bullpen throws "
+                           f"{sp_hand}HP; a favorable reliever bails him out, unlikely to be pulled (heavy dampen)")
+        elif dis_share < 0.45:
+            score *= 0.75
+            reasons.append(f"Favorable pen — {dis_share:.0%} of the projected bullpen throws "
+                           f"{sp_hand}HP; relief likely after the starter, lower pull odds (dampened)")
+        elif dis_share < 0.60:
+            score *= 0.90
+            reasons.append(f"Pen only {dis_share:.0%} {sp_hand}HP — some relief likely, mild dampen")
 
     return max(0, min(100, round(score))), reasons
 
@@ -1187,24 +1260,25 @@ def predict_bullpen(team_id, date_str, exclude_sp_id=None, n_games=7, top=4, una
                      key=lambda a: a["sv"], reverse=True)     # surfaced even if gassed-out
     return {"likely": likely, "closers": closers, "all": arms, "n_games": len(team_dates)}
 
-def flip_pen_read(pen_pred, bats):
+def pen_weak_share(pen_pred, weak_hand):
     """From a predict_bullpen() result, the USAGE-WEIGHTED share of the arms MOST LIKELY TO
-    PITCH today that throw the batter's OWN hand (== bats) — the arms that neutralize his
-    platoon edge and cue the flip pinch-hit. Weighting by likelihood means a gassed closer
-    (usage ~0) barely counts and a workhorse arm counts a lot — unlike a flat headcount. We do
-    NOT try to predict the middle-relief ORDER (too noisy) — just who's likely to appear.
-    Returns (share, seq, n_weak, n_tot); share is None when there's nothing to project (falls
-    back to the flat pen mix upstream). `seq` lists the arms most-likely-first for the reason text."""
+    PITCH today that throw `weak_hand` — the hand the batter hits POORLY against. For a FLIP
+    start weak_hand is the batter's OWN hand (a same-hand reliever flips his edge); for a
+    DISADVANTAGE (same-side) start it's the pitcher's hand (the weak matchup only persists if
+    that hand keeps coming — otherwise a favorable reliever bails him out). Weighting by
+    likelihood means a gassed closer (usage ~0) barely counts and a workhorse arm counts a lot
+    — unlike a flat headcount. We do NOT predict the middle-relief ORDER (too noisy) — just who's
+    likely to appear. Returns (share, seq, n_weak, n_tot); share is None when nothing to project."""
     if not pen_pred or not pen_pred.get("likely"):
         return None, None, 0, 0
     arms = [a for a in pen_pred["likely"] if a.get("hand") in ("L", "R")]
     tot = sum(a["usage"] for a in arms)
     if not arms or tot <= 0:
         return None, None, 0, 0
-    weak = sum(a["usage"] for a in arms if a["hand"] == bats)   # same hand as batter → flips edge
+    weak = sum(a["usage"] for a in arms if a["hand"] == weak_hand)
     seq = ", ".join(f"{a['name'].split()[-1]}({a['hand']})"
                     for a in sorted(arms, key=lambda a: a["usage"], reverse=True))
-    n_weak = sum(1 for a in arms if a["hand"] == bats)
+    n_weak = sum(1 for a in arms if a["hand"] == weak_hand)
     return weak / tot, seq, n_weak, len(arms)
 
 def active_hitters(team_id):
@@ -1277,6 +1351,7 @@ def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=Non
 
     mgr_meta = mgr.get(str(team["id"]), {})
     tier = mgr_meta.get("platoon_tier", "med")   # platoon-specific tendency (our picks are platoon spots)
+    recent_ph = manager_recent_ph(date_str, team["id"], 5)   # current 5-game PH profile + position swaps
     starter_ids = {s["id"] for s in starters}
     if bench is None:                       # fallback: season roster (no positions)
         bench = [p for p in active_hitters(team["id"]) if p["id"] not in starter_ids]
@@ -1318,6 +1393,18 @@ def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=Non
                                        bench_res_by_order.get(order),
                                        scenario, pen_mix, bvp, ph_count, sp_len, arsenal, sp_xw, pos,
                                        pen_pred=pen_pred)
+        # Recent (last-5-games) coach PH profile — current read that cuts through late-season
+        # roster churn, plus the position swaps he's actually been making. Flag it when he's
+        # recently pinch-hit for THIS player's position.
+        if recent_ph["n_ph"] > 0:
+            swaps_txt = ", ".join(recent_ph["swaps"][:6])
+            line = (f"Coach last {recent_ph['games']}g: {recent_ph['n_ph']} PH "
+                    f"({recent_ph['n_platoon']} platoon) — recent swaps: {swaps_txt}")
+            if pos and any(sw.startswith(f"{pos}→") for sw in recent_ph["swaps"]):
+                line += f" — incl. his spot ({pos})"
+        else:
+            line = f"Coach last {recent_ph['games']}g: 0 pinch-hits — inactive lately"
+        reasons = reasons + [line]
         if score >= MIN_SCORE:
             candidates.append({
                 "score": score, "name": prof.get("name") or s.get("fullName"),
