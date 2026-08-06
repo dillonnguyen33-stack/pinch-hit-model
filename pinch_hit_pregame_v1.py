@@ -704,7 +704,8 @@ def classify_matchup(prof, sp_hand):
 
 def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_res, scenario,
                   pen_mix=None, bvp=None, player_ph_count=0, sp_len=None, arsenal=None,
-                  sp_xw=None, starter_pos=None, pen_pred=None):
+                  sp_xw=None, starter_pos=None, pen_pred=None,
+                  recent_pulls=0, recent_pos_pulls=0):
     """Return (score 0-100, reasons[list]). Higher = more likely lifted = better under."""
     reasons = []
     score = 0.0
@@ -807,8 +808,11 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_res, scenario,
             score += min(10.0, (0.620 - r_ops) / 0.220 * 10.0)
             reasons.append(f"Cold last {RECENCY_DAYS}d: {_fmt(r_ops)} OPS over {r_pa} PA — bench/pull risk up")
         elif r_ops > 0.820:
-            score *= 0.85
-            reasons.append(f"Hot last {RECENCY_DAYS}d: {_fmt(r_ops)} OPS over {r_pa} PA — hot hand, managers ride it (dampened)")
+            if recent_pulls >= 2:                # coach is pulling him ANYWAY — don't "ride the hot bat"
+                reasons.append(f"Hot last {RECENCY_DAYS}d: {_fmt(r_ops)} OPS over {r_pa} PA — but the coach is pulling him regardless (not ridden)")
+            else:
+                score *= 0.85
+                reasons.append(f"Hot last {RECENCY_DAYS}d: {_fmt(r_ops)} OPS over {r_pa} PA — hot hand, managers ride it (dampened)")
         else:
             reasons.append(f"Recent form: {_fmt(r_ops)} OPS last {RECENCY_DAYS}d ({r_pa} PA)")
     elif 0 < r_pa < 15:
@@ -931,8 +935,12 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_res, scenario,
     # Positional realism: a starting CATCHER is rarely pinch-hit for before the 9th — it
     # burns the only backup and leaves the team a catcher short. Strong dampener.
     if starter_pos == "C":
-        score *= 0.55
-        reasons.append("Catcher — rarely pinch-hit for before the 9th (burns the backup); low early-pull risk")
+        if recent_pulls >= 2:                    # coach demonstrably pulls THIS catcher — prior is wrong for him
+            reasons.append(f"Catcher — but this coach has pinch-hit for him {recent_pulls}× in his last 5g "
+                           f"(a defensive backup is clearly on the bench); catcher prior overridden")
+        else:
+            score *= 0.55
+            reasons.append("Catcher — rarely pinch-hit for before the 9th (burns the backup); low early-pull risk")
 
     # Flip-likelihood gate. A flip pick's ENTIRE thesis is the opposing pen turning his
     # platoon edge to the weak side. How stacked the pen is toward his weak hand scales the
@@ -977,6 +985,20 @@ def score_starter(prof, sp_hand, sp_name, order, mgr_tier, bench_res, scenario,
         elif dis_share < 0.60:
             score *= 0.90
             reasons.append(f"Pen only {dis_share:.0%} {sp_hand}HP — some relief likely, mild dampen")
+
+    # Recent BEHAVIORAL evidence — the most current, most direct pull signal: this coach has
+    # ACTUALLY been pinch-hitting for THIS player (or his exact position) in his last 5 games.
+    # Applied LAST so it lifts past the platoon-math and positional priors it directly
+    # contradicts, and cuts through late-season roster churn where the 14-day tendency is stale.
+    if recent_pulls >= 2:
+        score += 15
+        reasons.append(f"Coach pinch-hit for HIM {recent_pulls}× in his last 5 games — active pull target (behavioral)")
+    elif recent_pulls == 1:
+        score += 8
+        reasons.append("Coach pinch-hit for him once in his last 5 games — recent pull evidence")
+    elif recent_pos_pulls >= 2:
+        score += 6
+        reasons.append(f"Coach has churned this position ({starter_pos}) {recent_pos_pulls}× in his last 5 games")
 
     return max(0, min(100, round(score))), reasons
 
@@ -1387,12 +1409,19 @@ def analyze_side(g, side, opp_side, starters, mgr, ph_hist=None, unavailable=Non
         order, s, prof, scenario, pos = (row["order"], row["s"], row["prof"],
                                          row["scenario"], row["pos"])
         bvp = get_bvp(s["id"], sp_id) if sp_id else None
-        ph_count = ph_hist.get(f"{team['id']}|{_lastname(prof.get('name') or s.get('fullName'))}", 0)
+        name_last = _lastname(prof.get("name") or s.get("fullName"))
+        ph_count = ph_hist.get(f"{team['id']}|{name_last}", 0)
         arsenal = arsenal_matchup(s["id"], sp_id) if sp_id else None
+        # recent BEHAVIORAL pull evidence (this coach's last 5g): how often he pinch-hit for
+        # THIS exact player, and for his POSITION — feeds the behavioral override in scoring.
+        recent_pulls = sum(1 for e in recent_ph["events"]
+                           if e.get("out_name") and _lastname(e["out_name"]) == name_last)
+        recent_pos_pulls = sum(1 for e in recent_ph["events"] if e.get("out_pos") == pos)
         score, reasons = score_starter(prof, sp_hand, sp_name, order, tier,
                                        bench_res_by_order.get(order),
                                        scenario, pen_mix, bvp, ph_count, sp_len, arsenal, sp_xw, pos,
-                                       pen_pred=pen_pred)
+                                       pen_pred=pen_pred,
+                                       recent_pulls=recent_pulls, recent_pos_pulls=recent_pos_pulls)
         # Recent (last-5-games) coach PH profile — current read that cuts through late-season
         # roster churn, plus the position swaps he's actually been making. Flag it when he's
         # recently pinch-hit for THIS player's position.
