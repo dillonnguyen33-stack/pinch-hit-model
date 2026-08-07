@@ -1749,6 +1749,10 @@ def run_scheduler():
                     print(f"[results] grading {yday}...")
                     grade_day(yday)
                     trend_board(today)          # post the daily "most pinch-hit-for" leaderboard
+                    try:
+                        why_digest(yday)        # capture every pull + post the nightly "why" reasoning
+                    except Exception as e:
+                        print(f"[why] {e}")
         except Exception as e:
             print(f"[serve] loop error: {e}")
         time.sleep(POLL_MINUTES * 60)
@@ -1776,6 +1780,13 @@ def _db():
     conn.execute("""CREATE TABLE IF NOT EXISTS pinch_hit_history(
         date TEXT, window_days INTEGER, name TEXT, team TEXT, team_id INTEGER, count INTEGER,
         PRIMARY KEY(date, window_days, name, team_id))""")
+    # EVERY starter pinch-hit for league-wide, with full context — the labeled dataset the
+    # model learns from (why did THIS guy get pulled?). Captured nightly by capture_pulls().
+    conn.execute("""CREATE TABLE IF NOT EXISTS pulls(
+        date TEXT, game_pk INTEGER, pid INTEGER, name TEXT, team TEXT, pos TEXT, bats TEXT,
+        inning INTEGER, pitcher_hand TEXT, in_name TEXT, in_hand TEXT, in_pos TEXT,
+        is_platoon INTEGER, was_pick INTEGER, our_score INTEGER, our_scenario TEXT,
+        PRIMARY KEY(date, game_pk, pid))""")
     return conn
 
 def db_snapshot_pinch_history(date_str, window_days, rows):
@@ -1981,6 +1992,145 @@ def grade_day(date_str, to_discord=True):
     else:
         print(body)
 
+# ── LEARNING LOOP: capture every pull + nightly "why" digest ───────────────────
+def capture_pulls(date_str):
+    """Persist the FULL context of EVERY starter pinch-hit for league-wide on `date_str` — the
+    labeled dataset the model learns from. One row per pulled starter: position, hand, the
+    inning, the pitcher's hand at the pull, who replaced him (hand+position), whether it was a
+    platoon swap, and whether WE flagged him (score/scenario). Idempotent. Returns row count."""
+    try:
+        sched = _get(f"{API}/schedule", params={"sportId": 1, "date": date_str, "gameType": "R"})
+    except Exception as e:
+        print(f"[capture] schedule error: {e}"); return 0
+    games = [g for d in sched.get("dates", []) for g in d.get("games", [])
+             if g.get("status", {}).get("abstractGameState") == "Final"]
+    ours = {}                                              # pid -> (score, scenario) for the join
+    try:
+        conn = _db()
+        for pid, sc, scen in conn.execute("SELECT pid, score, scenario FROM picks WHERE date=?", (date_str,)):
+            ours[pid] = (sc, scen)
+        conn.close()
+    except Exception:
+        pass
+    rows = []
+    for g in games:
+        pk = g["gamePk"]
+        try:
+            live = _get(f"{API11}/game/{pk}/feed/live", timeout=20)
+        except Exception:
+            continue
+        box = live.get("liveData", {}).get("boxscore", {}).get("teams", {})
+        starters = {}
+        for side in ("home", "away"):
+            starters[side] = {v["person"]["id"] for v in box.get(side, {}).get("players", {}).values()
+                              if v.get("battingOrder") and int(v["battingOrder"]) % 100 == 0}
+        for play in live.get("liveData", {}).get("plays", {}).get("allPlays", []):
+            half = play.get("about", {}).get("halfInning"); inn = play.get("about", {}).get("inning")
+            bside = "away" if half == "top" else "home"
+            phand = pitcher_hand(play.get("matchup", {}).get("pitcher", {}).get("id") or 0)
+            for ev in play.get("playEvents", []):
+                desc = ev.get("details", {}).get("description") or ""
+                if "pinch-hitter" not in desc.lower():
+                    continue
+                out_id = ev.get("replacedPlayer", {}).get("id"); in_id = ev.get("player", {}).get("id")
+                if out_id not in starters.get(bside, set()):
+                    continue                               # only STARTERS pinch-hit for
+                pbox = box.get(bside, {}).get("players", {})
+                out_pos = _ph_pos(pbox, out_id); in_pos = _ph_pos(pbox, in_id) if in_id else "?"
+                oh = batter_hand(out_id) if out_id else None; ih = batter_hand(in_id) if in_id else None
+                mo = re.search(r"pinch-hitter\s+(.+?)\s+replaces\s+(.+?)[.\n]", desc, re.IGNORECASE)
+                in_name = mo.group(1).strip() if mo else None; out_name = mo.group(2).strip() if mo else None
+                is_platoon = 1 if (oh in ("L", "R", "S") and ih in ("L", "R", "S") and oh != ih) else 0
+                team = _team_abbr(box.get(bside, {}).get("team", {}).get("id"))
+                sc, scen = ours.get(out_id, (None, None))
+                rows.append((date_str, pk, out_id, out_name, team, out_pos, oh, inn, phand,
+                             in_name, ih, in_pos, is_platoon, 1 if out_id in ours else 0, sc, scen))
+    if rows:
+        conn = _db()
+        conn.executemany("""INSERT OR REPLACE INTO pulls
+            (date,game_pk,pid,name,team,pos,bats,inning,pitcher_hand,in_name,in_hand,in_pos,
+             is_platoon,was_pick,our_score,our_scenario) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+        conn.commit(); conn.close()
+    print(f"[capture] {date_str}: stored {len(rows)} pulled starters")
+    return len(rows)
+
+def why_digest(date_str, to_discord=True):
+    """Nightly reasoning pass: WHY did our picks hit or miss, and WHO got pulled that we didn't
+    flag. Turns the captured pulls + graded picks into a feedback signal — the thing that makes
+    the model accumulate reasons instead of forgetting them. Rule-based; an optional Claude
+    'lesson of the night' paragraph is appended when ANTHROPIC_API_KEY is set."""
+    capture_pulls(date_str)                                # make sure the night is captured first
+    conn = _db()
+    picks = conn.execute("""SELECT name, team, score, scenario, pulled, pa, hit
+                            FROM picks WHERE date=? AND graded=1 ORDER BY score DESC""",
+                         (date_str,)).fetchall()
+    pulls = conn.execute("""SELECT name, team, pos, bats, inning, pitcher_hand, in_name, in_hand,
+                            is_platoon, was_pick, our_score, our_scenario FROM pulls WHERE date=?""",
+                         (date_str,)).fetchall()
+    conn.close()
+    if not picks and not pulls:
+        print(f"[why] {date_str}: nothing to digest."); return
+    pull_by_name = {p[0]: p for p in pulls}                # name -> pull row (context)
+    hit_lines, miss_lines = [], []
+    for name, team, score, scen, pulled, pa, hit in picks:
+        ctx = pull_by_name.get(name)
+        if hit:
+            if ctx and ctx[6]:                             # in_name present → real pinch-hit
+                inn, inn_name, inn_hand = ctx[4], ctx[6], ctx[7]
+                hit_lines.append(f"✅ {name} ({score}, {scen}) — pulled in the {inn}th for {inn_name} ({inn_hand})")
+            else:
+                hit_lines.append(f"✅ {name} ({score}, {scen}) — held to ≤3 PA")
+        else:
+            # a miss is always a non-pull (pulled→hit): say WHY the thesis didn't fire
+            why = {"flip": "flip never fired — the pen didn't turn to his weak hand (or the coach passed)",
+                   "disadvantage": "matchup held — a favorable reliever likely bailed him out, no pull",
+                   "none": "coach passed — no pull despite the recent pattern"}.get(scen, "played the full game")
+            miss_lines.append(f"❌ {name} ({score}, {scen}) — {pa} PA · {why}")
+    # WHO got pulled that we didn't flag (the learning signal — biggest opportunity)
+    missed = [p for p in pulls if not p[9] and p[8]]       # was_pick=0 AND platoon swap
+    missed_lines = [f"• {p[0]} ({p[1]}, {p[2]}) — pulled {p[4]}th for {p[6]} ({p[7]}) vs {p[5]}HP"
+                    for p in sorted(missed, key=lambda p: p[4])[:8]]
+    n_platoon = sum(1 for p in pulls if p[8]); n_caught = sum(1 for p in pulls if p[8] and p[9])
+    parts = [f"**Our picks:** {sum(1 for x in picks if x[6])}/{len(picks)} hit"]
+    if hit_lines:  parts += ["", "**Hits — the thesis fired:**"] + hit_lines
+    if miss_lines: parts += ["", "**Misses — why they didn't:**"] + miss_lines
+    parts += ["", f"**Platoon pulls we caught:** {n_caught}/{n_platoon} "
+                  f"({(n_caught/n_platoon*100 if n_platoon else 0):.0f}% recall)"]
+    if missed_lines:
+        parts += ["", "**Pulled but NOT on our board (learn these):**"] + missed_lines
+    lesson = _why_lesson(date_str, hit_lines, miss_lines, missed_lines)   # optional Claude paragraph
+    if lesson:
+        parts += ["", f"🧠 **Lesson:** {lesson}"]
+    body = "\n".join(parts)
+    if to_discord:
+        _post_embed({"title": f"🧠 Why digest — {date_str}", "description": body[:4000],
+                     "color": 0x9B59B6, "footer": {"text": "Pregame Pull-Risk — nightly reasoning"}})
+    else:
+        print(body)
+
+def _why_lesson(date_str, hit_lines, miss_lines, missed_lines):
+    """Optional one-paragraph 'lesson of the night' from Claude (skipped without an API key)."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    try:
+        ctx = (f"HITS:\n" + "\n".join(hit_lines) + "\n\nMISSES:\n" + "\n".join(miss_lines) +
+               "\n\nPULLED BUT WE MISSED:\n" + "\n".join(missed_lines))
+        r = _session.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150,
+                  "system": "You analyze one night of an MLB pinch-hit pull-risk model. In 1-2 "
+                            "sentences, name the single most actionable PATTERN in the misses or "
+                            "the pulls we didn't flag — what should the model learn? Be concrete, "
+                            "no preamble.",
+                  "messages": [{"role": "user", "content": ctx[:3000]}]},
+            timeout=10)
+        r.raise_for_status()
+        return r.json()["content"][0]["text"].strip()
+    except Exception as e:
+        print(f"[why-lesson] {e}"); return None
+
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
@@ -2002,6 +2152,9 @@ def main():
     ap.add_argument("--clear-posted", action="store_true",
                     help="wipe today's posted-state so serve re-scans every game/side on its next "
                          "poll (use after a mid-slate fix to force fresh boards)")
+    ap.add_argument("--why", nargs="?", const="__yday__", default=None, metavar="DATE",
+                    help="capture every league-wide pull + post the nightly 'why' digest "
+                         "(why picks hit/missed + who we didn't flag). Default: yesterday.")
     args = ap.parse_args()
 
     if args.clear_posted:
@@ -2024,6 +2177,13 @@ def main():
         if date == "__today__":
             date = (datetime.now(ET_TZ).date() - timedelta(days=1)).strftime("%Y-%m-%d")
         grade_day(date, to_discord=not args.print_only)
+        return
+
+    if args.why is not None:
+        date = args.why
+        if date == "__yday__":
+            date = (datetime.now(ET_TZ).date() - timedelta(days=1)).strftime("%Y-%m-%d")
+        why_digest(date, to_discord=not args.print_only)
         return
 
     if args.serve:
