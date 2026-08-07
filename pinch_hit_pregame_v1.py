@@ -462,7 +462,10 @@ def _scan_recent_subs(date_str, window_days):
     if window_days <= 0:
         return {"teams": {}, "players": {}, "pitchers": {}, "pen_usage": {}, "ph_events": {}, "team_dates": {}}
     cache = _load(SUBS_CACHE_PATH)
-    ck = f"{date_str}:{window_days}"
+    # ':v2' — bump when the scan's RESULT SHAPE changes so stale blobs on the persistent volume
+    # aren't served missing new fields. v2 added pen_usage / ph_events / team_dates; an older
+    # cached blob lacks them → recent-PH profile silently read "Coach last 0g" on every card.
+    ck = f"{date_str}:{window_days}:v2"
     if ck in cache:
         return cache[ck]
 
@@ -646,6 +649,9 @@ def manager_recent_ph(date_str, team_id, games=5):
     scan = _scan_recent_subs(date_str, MANAGER_LOOKBACK_DAYS)
     tid = str(team_id)
     dates = scan.get("team_dates", {}).get(tid, [])
+    if not dates:                                             # fallback: derive dates from pen_usage
+        dates = sorted({d for pu in scan.get("pen_usage", {}).values()
+                        if str(pu.get("team")) == tid for d in pu.get("apps", {})})
     window = set(sorted(dates, reverse=True)[:games])          # this team's most recent N game-dates
     evs = [e for e in scan.get("ph_events", {}).get(tid, []) if e.get("date") in window]
     n_platoon = sum(1 for e in evs
